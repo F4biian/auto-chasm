@@ -13,6 +13,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
+from auto_chasm._mlx_compat import ensure_mlx_lm_compat
 from auto_chasm.logger import get_logger
 
 logger = get_logger(__name__)
@@ -24,6 +25,7 @@ _ADAPTER_LEAVES = frozenset({"lora_a", "lora_b", "m"})
 
 def _lora_module_types() -> tuple[type, ...]:
     """Return the mlx_lm adapter module classes available in this install."""
+    ensure_mlx_lm_compat()
     types: list[type] = []
     try:
         from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
@@ -266,6 +268,7 @@ class MLXModelWrapping:
         Raises:
             ValueError: If the model already has LoRA/DoRA adapters applied.
         """
+        ensure_mlx_lm_compat()
         from mlx_lm.tuner.utils import linear_to_lora_layers
 
         # Cover every adapter module kind (linear, switch, embedding; LoRA and DoRA) so

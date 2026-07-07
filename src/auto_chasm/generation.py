@@ -25,6 +25,7 @@ from auto_chasm._generation_utils import (
     reject_num_return_sequences,
     stream_flush,
 )
+from auto_chasm._mlx_compat import ensure_mlx_lm_compat
 
 # Re-exported for backwards compatibility (callers import these from here).
 __all__ = [
@@ -38,8 +39,7 @@ __all__ = [
     "generate_stream",
 ]
 
-# Default repetition guard: an int caps consecutive identical tokens before stopping
-# early (None disables it). High by default so it only catches pathological repeat loops.
+# Default repetition guard: cap on consecutive identical tokens before stopping (None disables).
 DEFAULT_MAX_REPEAT = 256
 
 
@@ -319,12 +319,12 @@ def _generate_mlx(
             repetition_penalty=rep,
             use_cache=use_cache,
         )
+    ensure_mlx_lm_compat()
     try:
         from mlx_lm import generate as mlx_generate
 
         gen_kwargs: dict[str, Any] = {}
-        # Translate sampling params into mlx_lm constructs instead of forwarding
-        # them raw (mlx_lm.generate would silently ignore top_p/top_k/rep).
+        # Translate sampling params into mlx_lm constructs (raw forwarding would be ignored).
         kwargs.pop("do_sample", None)
         if temperature > 0 or top_p is not None or top_k is not None:
             from mlx_lm.generate import make_sampler

@@ -16,7 +16,7 @@ from __future__ import annotations
 import csv
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from auto_chasm.config import ProbeConfig
 from auto_chasm.metrics import classification_metrics
@@ -30,9 +30,9 @@ if TYPE_CHECKING:
     from auto_chasm.trainers.loss import LossFn
 
     # What the sweep accepts as a dataset: a Dataset, or a raw list of samples.
-    type DatasetLike = Dataset | Sequence[dict[str, Any]]
+    DatasetLike: TypeAlias = Dataset | Sequence[dict[str, Any]]
     # A probe head spec: a built-in name, a ModuleSpec, or a builder callable.
-    type HeadSpec = str | ModuleSpec | Callable[..., Any]
+    HeadSpec: TypeAlias = str | ModuleSpec | Callable[..., Any]
 
 
 def _snapshot(module: Any, backend: str) -> Any:

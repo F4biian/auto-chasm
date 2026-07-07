@@ -5,8 +5,9 @@ Keeps ``model.py`` free of direct framework imports.
 
 from __future__ import annotations
 
-import contextlib
 from typing import Any, Literal, cast
+
+from auto_chasm._mlx_compat import ensure_mlx_lm_compat
 
 
 def detect_backend() -> Literal["mlx", "torch"]:
@@ -59,42 +60,6 @@ def resolve_backend_name(backend_name: str | None) -> Literal["mlx", "torch"]:
     return cast(Literal["mlx", "torch"], backend_name)
 
 
-def _ensure_mlx_lm_import_compat() -> None:
-    """Let ``import mlx_lm`` succeed against transformers >= 5.9.
-
-    mlx-lm (through its latest release, 0.31.3) registers a custom
-    ``NewlineTokenizer`` under a *string* key at import time via
-    ``AutoTokenizer.register``. transformers >= 5.9 tightened the auto-mapping
-    registration to read ``key.__module__``, which raises ``AttributeError`` on a
-    ``str``. Wrapping ``_LazyAutoMapping.register`` to store non-class keys
-    directly (exactly the pre-5.9 behaviour) lets mlx-lm import on both older and
-    newer transformers. Idempotent, and a harmless no-op once the two libraries
-    resolve this upstream.
-    """
-    try:
-        from transformers.models.auto import auto_factory
-    except Exception:
-        return  # transformers absent or restructured — nothing to patch
-
-    mapping = getattr(auto_factory, "_LazyAutoMapping", None)
-    original = getattr(mapping, "register", None)
-    if mapping is None or original is None or getattr(original, "_auto_chasm_patched", False):
-        return
-
-    def register(self: Any, key: Any, value: Any, exist_ok: bool = False) -> None:
-        """Register ``key`` -> ``value``, tolerating mlx-lm's non-class string keys."""
-        if isinstance(key, type):  # a real config class → stock path, unchanged
-            original(self, key, value, exist_ok=exist_ok)
-            return
-        # A non-class key (mlx-lm's str) would trip the newer ``key.__module__``
-        # guard; store it directly, as transformers < 5.9 did.
-        with contextlib.suppress(Exception):  # pragma: no cover - upstream layout change
-            self._extra_content[key] = value
-
-    register._auto_chasm_patched = True  # type: ignore[attr-defined]
-    mapping.register = register
-
-
 def load_mlx(model_name: str, **kwargs: Any) -> tuple[Any, Any]:
     """Load a model and tokenizer via mlx-lm.
 
@@ -105,7 +70,7 @@ def load_mlx(model_name: str, **kwargs: Any) -> tuple[Any, Any]:
     Returns:
         Tuple of ``(model, tokenizer)``.
     """
-    _ensure_mlx_lm_import_compat()
+    ensure_mlx_lm_compat()
     from mlx_lm import load
 
     kwargs.pop("dtype", None)  # mlx-community ports are already bf16; mlx_lm takes no torch dtype

@@ -3,7 +3,7 @@ name = "auto-chasm"
 version = "0.1.0"
 description = "Cross-platform research library for self-supervised internal state alignment and steerable generation"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Fabian Ridder", email = "email@fabian-ridder.com" }]
@@ -69,7 +69,7 @@ filterwarnings = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 100
 # `demo/` holds illustrative, run-verified scripts (not library code), so they are
 # exempt from lint/format — they're checked by actually running.
@@ -111,7 +111,7 @@ ignore = [
 convention = "google"
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 explicit_package_bases = true
 no_site_packages = true

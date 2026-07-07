@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from auto_chasm._mlx_compat import ensure_mlx_lm_compat
 from auto_chasm.logger import get_logger
 
 logger = get_logger(__name__)
@@ -567,6 +568,7 @@ def _unfreeze_lora_params(model: Any, backend: Any) -> None:
         backend: The backend instance.
     """
     if backend.name == "mlx":
+        ensure_mlx_lm_compat()
         try:
             from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
 

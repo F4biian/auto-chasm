@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from auto_chasm._mlx_compat import ensure_mlx_lm_compat
+
 
 def _last_logits(out: Any) -> Any:
     """Return the last-position logits from a model output (ModelOutput/tuple/tensor)."""
@@ -45,6 +47,7 @@ class MlxDecoder:
         self.cache: Any = None
         self._fed = 0
         if use_cache:
+            ensure_mlx_lm_compat()
             try:
                 from mlx_lm.models.cache import make_prompt_cache
 
