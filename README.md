@@ -1,9 +1,10 @@
 # auto-chasm
 
-Attach small **probe heads** to a language model, **train them jointly** with the
-model (or on their own), read their predictions **live during generation**, and
-**steer** the model's activations along what a probe learned — all through one
-API that runs on **Apple's MLX** and **PyTorch** without code changes.
+Attach small **probe heads** to a language model and **train them jointly** with
+the model (or on their own), then read their predictions **live during
+generation** — all through one API that runs on **Apple's MLX** and **PyTorch**
+without code changes. Probes can additionally **steer** the model's activations
+along what they learned.
 
 ```python
 from auto_chasm import Model

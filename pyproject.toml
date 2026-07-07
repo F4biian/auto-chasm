@@ -1,12 +1,12 @@
 [project]
 name = "auto-chasm"
 version = "0.1.0"
-description = "Cross-platform research library for self-supervised internal state alignment and steerable generation"
+description = "Attach probe heads to a language model and jointly train them with the base — cross-backend (MLX + PyTorch)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Fabian Ridder", email = "email@fabian-ridder.com" }]
+authors = [{ name = "Fabian Ridder" }]
 # Core depends only on the backend-agnostic numeric layer. A backend is chosen by
 # installing an extra — the two are EQUAL PEERS, neither is in core:
 #   pip install auto-chasm[mlx]     # Apple-silicon / MLX

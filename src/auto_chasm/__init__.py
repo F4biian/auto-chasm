@@ -1,4 +1,4 @@
-"""auto-chasm: Self-supervised internal state alignment for language models.
+"""auto-chasm: probe heads for language models — attach, jointly train, read live.
 
 The top-level namespace is the **curated public API** — the objects the common
 workflows need (build a model + probes, prepare data, infer the task, train, sweep
