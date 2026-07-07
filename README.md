@@ -1,0 +1,672 @@
+# auto-chasm
+
+Attach small **probe heads** to a language model, **train them jointly** with the
+model (or on their own), read their predictions **live during generation**, and
+**steer** the model's activations along what a probe learned — all through one
+API that runs on **Apple's MLX** and **PyTorch** without code changes.
+
+```python
+from auto_chasm import Model
+
+model = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+print(model.generate("2 + 2 =", max_tokens=4))   # works before any training
+```
+
+A *probe* is a tiny classifier or regressor that reads a hidden layer's activations
+and predicts a property of the text — is this a question, does it contain a digit,
+what sentiment, how confident. `auto-chasm` makes attaching, training, inspecting,
+and steering with such probes a few lines each.
+
+## Contents
+
+[Install](#install) · [Quickstart](#quickstart--the-whole-pipeline) ·
+[Data & labels](#data--labels) · [Probes](#probes) ·
+[Training](#training) · [Custom losses](#custom-losses) ·
+[Generation & inspection](#generation--probe-inspection) · [Steering](#steering) ·
+[LoRA, checkpoints & layer sweeps](#lora-checkpoints--layer-sweeps) ·
+[Model stats & backends](#model-stats--backends) · [API](#api-at-a-glance)
+
+Each section leads with a runnable example; the details fold into expandable
+sections so the page stays scannable. Every example uses a small model that loads on
+both backends. The runnable scripts under [`demo/`](demo/) mirror each section.
+
+---
+
+## Install
+
+Install directly from the Git repository, choosing a backend via extras:
+
+```bash
+pip install "auto-chasm[mlx]   @ git+https://github.com/F4biian/auto-chasm.git"  # Apple silicon (MLX)
+pip install "auto-chasm[torch] @ git+https://github.com/F4biian/auto-chasm.git"  # CUDA / CPU (PyTorch)
+```
+
+`import auto_chasm` works with **either** backend installed alone — the same code
+runs on both. The backend is auto-detected from what is installed; pass
+`backend_name="mlx"` or `"torch"` to force one.
+
+---
+
+## Quickstart — the whole pipeline
+
+Each step is one block and builds on the previous. Run them in order.
+
+**1 — Load a model.** Generation works immediately, no training required.
+
+```python
+from auto_chasm import Model
+
+model = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+```
+
+**2 — Describe labeled data.** `Dataset.from_texts` takes texts and one label each,
+placed at a *site* in the text. `label_site="response"` labels the whole text (the
+last token's state); `append_eos=True` moves that label onto an appended end token so
+the probe reads the *entire* text.
+
+```python
+from auto_chasm import Dataset
+
+texts  = ["The sky is blue.", "Is it raining?", "Cats purr.", "Where are you?"]
+labels = [0, 1, 0, 1]                      # 1 = question, 0 = statement — the label semantics
+
+data = Dataset.from_texts(texts, labels, model.tokenizer, probe_name="is_question",
+                          label_site="response", append_eos=True)
+```
+
+**3 — Attach a probe.** A `ProbeConfig` names the head and picks which layer(s) it
+reads. The default head is a single linear unit (a binary classifier).
+
+```python
+from auto_chasm import ProbeConfig
+
+model.attach_probe(ProbeConfig(name="is_question", layers=[-1]))   # -1 = last layer
+model.prepare_for_joint_training()                                 # freeze base; train probes (+ LoRA)
+```
+
+**4 — Train.** `Trainer` runs the loop; `JointLoss` combines the language-model loss
+and each probe's loss by name. Here the language-model term is off (`"lm_head": 0.0`).
+
+```python
+from auto_chasm import Trainer, JointLoss
+
+Trainer(
+    model=model,
+    loss_fn=JointLoss(weights={"lm_head": 0.0, "is_question": 1.0}),
+    num_iters=20,
+    batch_size=2,
+).train(data)
+```
+
+**5 — Inspect during generation.** `generate_with_probes` yields one step per token,
+each carrying the token and every probe's output at that step.
+
+```python
+import math
+
+for step in model.generate_with_probes("The weather today is", max_tokens=5):
+    logit = float(step.probes["is_question"].logits[0, -1].item())
+    print(f"{step.token_str!r}  p(question)={1 / (1 + math.exp(-logit)):.2f}")
+```
+
+**6 — Steer, then save.** Steering nudges activations along the axis the probe learned
+(it needs the per-class average activations). `save_checkpoint` bundles everything.
+
+```python
+from auto_chasm import SteeringConfig
+
+class_means = model.compute_class_means(data)
+model.enable_steering("is_question", config=SteeringConfig(method="nullify"), class_means=class_means)
+print(model.generate("The weather today is", max_tokens=6))
+model.disable_steering("is_question")
+
+model.save_checkpoint("./runs/is-question")
+restored = Model.from_checkpoint("./runs/is-question")   # probes + adapters + steering
+```
+
+---
+
+## Data & labels
+
+You give the library **labels placed on characters**, and it maps them to the right
+tokens. There are two entry points.
+
+### `Dataset.from_texts` — one label per text
+
+```python
+data = Dataset.from_texts(texts, labels, model.tokenizer, probe_name="p", label_site="response")
+```
+
+`label_site` decides where the single label lands:
+
+| `label_site` | Labels… | Use for |
+|---|---|---|
+| `"response"` (default) | the last character (whole-text representation) | text-level classification / regression |
+| `"token"` | every character from `warmup_chars` onward | per-token properties after a warm-up |
+| `"sentence"` | each sentence-ending delimiter | per-sentence properties (needs `sentence_delimiters=[".", "!", "?"]`) |
+
+Labels may be **int class indices** (classification) or **floats** (regression — see
+[Custom losses & regression](#custom-losses)).
+
+<details>
+<summary>All <code>from_texts</code> parameters</summary>
+
+```python
+Dataset.from_texts(
+    texts,                    # Sequence[str]
+    labels,                   # Sequence[float] — int class indices, or floats for regression
+    tokenizer,                # your model's tokenizer
+    *,
+    label_site="response",    # "response" | "token" | "sentence"
+    warmup_chars=50,          # for "token": first labeled character
+    sentence_delimiters=None, # for "sentence": e.g. [".", "!", "?"]
+    probe_name="probe",       # which head these labels train
+    offset=0,                 # shift labels by N tokens
+    default_label=None,       # label for unmarked tokens; None masks them (-100)
+    append_eos=False,         # append EOS and move a "response" label onto it (recommended)
+    groups=None,              # per-text group key -> split(groups="group") keeps a group together
+)
+```
+
+**`append_eos=True` is strongly recommended for `label_site="response"`.** Without it,
+the response label sits on the last content token, whose state the loss never reads
+(it is dropped as the final input under next-token alignment). Appending an EOS and
+moving the label onto it supervises the state *after* reading the whole text.
+</details>
+
+### `build_dataset` / `Dataset.from_conversations` — character spans
+
+For finer control (per-character labels, multiple heads, chat turns) mark **spans**
+`{"start", "end", "label"}` per probe, per message:
+
+```python
+from auto_chasm.data import build_dataset
+
+conversations = [
+    [{"role": "user", "content": "I have 3 cats",
+      "labels": {"digit": [{"start": 7, "end": 8, "label": 1}]}}],
+]
+data = build_dataset(conversations, model.tokenizer, default_label=0)
+```
+
+- **Only the spans you mark are labeled.** Everything else is masked (`-100`, not
+  trained) — unless you pass `default_label=0`, which makes unmarked tokens the
+  negative class inside any message that has at least one span.
+- A message with `"labels": {}` is skipped for that probe.
+- `aggregation` (`"max"`/`"min"`/`"mean"`) resolves overlapping spans on one token.
+
+<details>
+<summary>Split, class balance, and inferring the task from labels</summary>
+
+```python
+train, val = data.split(0.15, seed=42)                    # deterministic 85/15 split (two Datasets)
+train, val = data.split(0.15, stratify="label")           # keep class balance across the split
+train, val = data.split(0.15, groups="group")             # keep a group entirely on one side (no leakage)
+
+weights = data.class_weights(num_classes=3)   # inverse-frequency ("balanced") per-class weights
+task    = data.infer_task()                   # Task.binary()/multiclass(k)/regression() from the labels
+```
+
+`split` is always at the sample (or group) level, never the token level, so one
+text's tokens are never divided across train and val. `class_weights` feeds
+[class-imbalance handling](#training); `infer_task` sizes a head and picks its metrics
+automatically (used by [`LayerSweep`](#lora-checkpoints--layer-sweeps)).
+</details>
+
+---
+
+## Probes
+
+A `ProbeConfig` is a small, declarative description of a head. The only required
+fields are `name` and `layers`.
+
+```python
+from auto_chasm import ProbeConfig
+
+ProbeConfig(name="sentiment", layers=[-1])                                # linear binary head, last layer
+ProbeConfig(name="topic", layers=[8], module_config={"out_features": 5})  # 5-class head on layer 8
+ProbeConfig(name="score", layers=[-1])                                    # width-1 head -> a regressor
+```
+
+### Read several layers at once
+
+Pass multiple `layers`; `aggregation` decides how they combine before the head:
+
+```python
+ProbeConfig(name="deep", layers=[6, 9, 12], aggregation="concat")   # concatenate the three layers
+ProbeConfig(name="avg",  layers=[6, 9, 12], aggregation="mean")     # average them
+```
+
+`"concat"` (default) sizes the head to `len(layers) * hidden`; `"mean"`/`"max"`/`"last"`
+keep it at `hidden`; a callable `(list_of_states) -> tensor` does anything else. All
+captured layers are used for both training and evaluation.
+
+### Custom heads
+
+`module_type` accepts three levels of control:
+
+```python
+from auto_chasm import ModuleSpec
+
+# 1. A built-in name — sized via module_config.
+ProbeConfig(name="p", layers=[-1], module_type="mlp", module_config={"hidden_dims": [128, 64]})
+
+# 2. A ModuleSpec — a declarative, BACKEND-AGNOSTIC head (depth, activation, dropout,
+#    layer-norm). The library builds the concrete module on whichever backend you run,
+#    and it checkpoints/reloads cleanly.
+ProbeConfig(name="p", layers=[-1],
+            module_type=ModuleSpec.mlp(hidden_dims=[128, 64], activation="gelu", dropout=0.1))
+
+# 3. A callable (in_features, cfg) -> module — return ANY framework module, so you can
+#    build absolutely anything the framework supports. This is your escape hatch and is
+#    NOT backend-agnostic (you construct a concrete torch/mlx module yourself).
+def build_head(in_features, cfg):
+    import torch.nn as nn
+    return nn.Sequential(nn.LayerNorm(in_features), nn.Linear(in_features, cfg.get("out_features", 1)))
+
+ProbeConfig(name="p", layers=[-1], module_type=build_head)
+```
+
+The probe applies its own layer aggregation and granularity pooling *around* the head, so
+a head is just an `in_features -> out_features` module. See
+[`demo/demo_custom_head.py`](demo/demo_custom_head.py) — a `ModuleSpec` head and a raw
+`torch.nn.Module` head trained on the real model (`Model.from_pretrained(..., backend_name="torch")`).
+
+<details>
+<summary>Every <code>ProbeConfig</code> field and its options</summary>
+
+| Field | Values | Meaning |
+|---|---|---|
+| `name` | any string except `"lm_head"` | the head's key everywhere (loss weights, outputs) |
+| `layers` | `list[int]` (negatives allowed) | which layer(s) the head reads; `[-1]` is the last |
+| `source` | `"hidden"` (default), `"residual"`, `"attention"`, `"mlp"`, `"embedding"`, `"logits"` | which activation to read. `hidden`/`residual`/`attention`/`mlp` are per-layer (may span several `layers`); `embedding`/`logits` read a single site (one layer) |
+| `granularity` | `"token"` (default), `"response"`, `"sentence"`, `"custom"` | one prediction per token, per whole text (mean-pooled), per sentence, or a custom pooler |
+| `module_type` | `"linear"` (default), `"mlp"`, a `ModuleSpec`, or a callable | the head architecture (see [Custom heads](#custom-heads)) |
+| `module_config` | `dict` | head sizing, e.g. `{"out_features": 5}` for 5 classes, or MLP `hidden_dims` |
+| `aggregation` | `"concat"` (default), `"mean"`, `"max"`, `"last"`, or a callable | how multiple `layers` combine before the head |
+| `pooling` | callable | custom time pooler for `granularity="custom"` |
+| `layer_norm` | `bool` | apply a layer-norm to captured activations before the head |
+
+The output width is the head width: `1` (default) is binary/regression; `{"out_features": k}` makes a `k`-class head.
+</details>
+
+<details>
+<summary>Multiple heads at once</summary>
+
+```python
+model.add_probes([
+    ProbeConfig(name="is_question", layers=[-1]),                             # binary (BCE)
+    ProbeConfig(name="topic", layers=[8], module_config={"out_features": 5}), # 5-class (CE)
+    ProbeConfig(name="length", layers=[-1]),                                  # regression (MSE)
+])
+```
+
+Each head trains on its own labels — pass a `{probe_name: labels}` dict per sample,
+or build each probe's data with its own `probe_name` and pair them on the same tokens
+(see [`demo/demo_multihead.py`](demo/demo_multihead.py)) — and its own loss (below).
+</details>
+
+---
+
+## Training
+
+`Trainer` runs the loop; the **loss function** decides what is optimized. The same
+`Trainer` and `JointLoss` run on both backends.
+
+```python
+from auto_chasm import Trainer, JointLoss
+
+trainer = Trainer(
+    model=model,
+    loss_fn=JointLoss(weights={"lm_head": 1.0, "is_question": 2.0}),  # LM loss + 2× the probe loss
+    num_iters=200,
+    batch_size=4,
+    learning_rate=2e-4,
+    eval_steps=50,                       # evaluate val every 50 steps
+    early_stopping_patience=4,           # stop after 4 evals without improvement
+)
+result = trainer.train(train, val_data=val, test_data=test)
+history = result["history"]              # per-step losses, val metrics, best checkpoint
+```
+
+The loss over `{"lm_head"} ∪ {probe names}` is a weighted sum by default; each term
+picks its own loss:
+
+```python
+JointLoss(weights={"lm_head": 0.0, "sentiment": 1.0})     # probe-only (LM term off)
+JointLoss(losses={"topic": "ce", "length": "mse"})        # per-probe loss choice
+```
+
+Built-in loss names: **`"bce"`** (binary, the default), **`"ce"`** (multi-class),
+**`"mse"`** and **`"mae"`** (regression). A term with weight `≤ 0` is skipped. For your
+own losses see [Custom losses](#custom-losses).
+
+### Class imbalance
+
+Weight the cross-entropy so rare classes count more. Compute inverse-frequency weights
+from the data, or let the trainer resolve `"balanced"`:
+
+```python
+weights = train.class_weights(num_classes=3)              # e.g. [0.6, 2.5, 1.9]
+JointLoss(losses={"topic": "ce"}, class_weights=weights)
+
+JointLoss(losses={"topic": "ce"}, class_weights="balanced")   # Trainer.train computes it from train_data
+```
+
+### Early stopping
+
+`Trainer` stops when the monitored metric stops improving and **restores the best
+checkpoint**:
+
+```python
+Trainer(model=model, loss_fn=..., eval_steps=50,
+        early_stopping_patience=4,             # evals without improvement before stopping
+        early_stopping_metric="val_loss",      # what to monitor
+        min_delta=1e-4)
+```
+
+To early-stop on a probe metric (accuracy, F1) instead of the loss, pass an
+`eval_metrics_fn` and monitor its key with the right direction:
+
+```python
+from auto_chasm.trainers import default_binary_metrics   # -> <probe>_accuracy/_precision/_recall/_f1
+
+Trainer(model=model, loss_fn=..., eval_metrics_fn=default_binary_metrics,
+        early_stopping_metric="val_is_question_f1",   # "val_<probe>_<metric>"
+        early_stopping_higher_is_better=True)          # F1/accuracy: maximize
+```
+
+For **per-layer** early stopping — each layer's head kept at *its own* best step — use
+[`LayerSweep`](#lora-checkpoints--layer-sweeps), which snapshots every layer
+independently.
+
+### Mixed precision
+
+Train the frozen base in half precision while the trainable probe/adapter params and
+the optimizer stay `fp32`:
+
+```python
+from auto_chasm import TrainingConfig
+
+Trainer(model=model, loss_fn=..., config=TrainingConfig(mixed_precision="bf16"))
+```
+
+`"bf16"` runs on **both backends** — it casts the base to bfloat16 and, because bf16
+shares fp32's exponent range, needs no loss scaling. `"fp16"` is **torch-only**: it keeps
+weights in fp32 and runs the forward under `torch.autocast` + a `GradScaler` (fp16's
+narrow range needs loss scaling); it raises on MLX, where bf16 is preferred. See
+[`demo/demo_mixed_precision.py`](demo/demo_mixed_precision.py) — a probe trained in bf16
+on the real model that generalizes to held-out text.
+
+<details>
+<summary>All the training knobs (Trainer)</summary>
+
+```python
+Trainer(
+    model, loss_fn,
+    learning_rate=2e-4, weight_decay=0.0, grad_clip_norm=1.0,
+    num_iters=500, batch_size=8, max_seq_length=256, grad_accum_steps=1,
+    logging_steps=25, save_steps=100, eval_steps=None,
+    early_stopping_patience=15, early_stopping_metric="val_loss",
+    early_stopping_higher_is_better=False, min_delta=1e-4,
+    keep_best_only=False, save_history=True, output_dir="./checkpoints",
+    lr_schedule="cosine", warmup_ratio=0.0,          # "cosine" | "linear" | "constant"
+    eval_metrics_fn=None,                            # custom val metrics (probe F1/accuracy/...)
+    callbacks=None, verbose=True,
+    config=None,                                     # a TrainingConfig; explicit kwargs override it
+)
+```
+
+`train(train_data, val_data=None, test_data=None)` returns
+`{"history", "test_metrics", "output_dir"}`. Every explicit keyword argument wins over
+a `config=TrainingConfig(...)`, even when it equals the default.
+</details>
+
+---
+
+## Custom losses
+
+You are not limited to the built-in loss names. Write a loss **per probe** and let
+`JointLoss` combine it with the others, or write **one loss for everything** from
+scratch.
+
+### Per-probe: any callable `(probe, target)`
+
+The `probe` argument is a bound output exposing `.logits`, `.softmax()`,
+`.log_softmax()`, and `.reduce()` (which averages over the valid, non-padding
+positions for you). Build KL, margin, focal, … — anything — and stay backend-agnostic:
+
+```python
+from auto_chasm import ops
+
+def soft_margin(probe, target):                       # a loss the built-ins don't cover
+    signed = 2.0 * target - 1.0                        # {0,1} labels -> {-1,+1}
+    return probe.reduce(ops.softplus(-signed * probe.logits))
+
+# "q" uses your loss, "s" uses the built-in BCE; JointLoss sums them by weight.
+JointLoss(weights={"lm_head": 0.0, "q": 1.0, "s": 1.0}, losses={"q": soft_margin})
+```
+
+For a total that is **not** a weighted sum, pass `combine=` — a lambda over the named
+terms, which compose with ordinary Python operators (`+ - * / **`):
+
+```python
+JointLoss(combine=lambda t: t.lm_head + 2.0 * t.sentiment ** 2)   # weight the squared probe term
+```
+
+### Fully custom: your own `loss_fn`
+
+Pass `Trainer` any callable `loss_fn(model, batch, labels, lengths) -> (total, ntoks,
+components)`. It runs the model, reads the raw probe outputs, and returns the scalar
+total plus a `components` dict for logging:
+
+```python
+def my_loss(model, batch, labels, lengths):
+    _, probes = model(batch[:, :-1])                   # run the model; read raw head outputs
+    logits, target = probes["p"], labels[:, 1:]
+    valid = target != -100                             # exclude ignored / padding positions
+    per_token = ops.clamp(1.0 - (2.0 * target - 1.0) * logits, lo=0.0) ** 2   # squared hinge
+    total = ops.masked_mean(per_token, valid)
+    return total, ops.sum(valid), {"squared_hinge": total}
+
+Trainer(model=model, loss_fn=my_loss, num_iters=200, batch_size=4).train(data)
+```
+
+`ops` is the backend-agnostic math facade (`ops.exp`, `ops.clamp`, `ops.softmax`,
+`ops.masked_mean`, …) so one custom loss runs on MLX and PyTorch.
+
+### Regression
+
+A width-1 head with the `"mse"` (or `"mae"`) loss regresses a continuous target.
+`from_texts` keeps float labels as floats:
+
+```python
+scores = [0.2, 3.5, 1.1, 2.8]   # continuous targets
+data = Dataset.from_texts(texts, scores, model.tokenizer, probe_name="score",
+                          label_site="response", append_eos=True)
+model.attach_probe(ProbeConfig(name="score", layers=[-1]))          # width-1 = scalar regressor
+Trainer(model=model, loss_fn=JointLoss(weights={"lm_head": 0.0, "score": 1.0},
+                                       losses={"score": "mse"}), num_iters=100).train(data)
+pred = float(model.forward([model.tokenizer.encode("some text")]).probes["score"].logits[0, -1].item())
+```
+
+See [`demo/demo_custom_loss.py`](demo/demo_custom_loss.py),
+[`demo/demo_fully_custom_loss.py`](demo/demo_fully_custom_loss.py), and
+[`demo/demo_regression.py`](demo/demo_regression.py).
+
+---
+
+## Generation & probe inspection
+
+```python
+model.generate("Once upon a time", max_tokens=50, temperature=0.7)       # sample
+"".join(model.generate_stream("Once upon a time", max_tokens=50))         # stream token pieces
+model.chat([{"role": "user", "content": "Hello!"}])                       # chat-templated (instruct models)
+```
+
+Stop control and the repetition guard are keyword arguments:
+
+```python
+model.generate("List three colors:", max_tokens=100,
+               stop_sequences=["\n\n"],   # stop when this text appears
+               stop_tokens=[13],          # …or on these token ids
+               max_repeat=None)           # None disables the repeat guard; an int caps identical repeats
+```
+
+`generate_with_probes` streams a `GenerationStep` per token — `.token_id`,
+`.token_str`, `.next_logits`, and `.probes[name]` (each probe's output at that step).
+
+Streaming and custom-stop generation use an incremental **KV cache** (`use_cache=True`,
+the default) so decoding is O(n), not O(n²) — see
+[`demo/demo_kv_cache.py`](demo/demo_kv_cache.py). It is an optimization only: the output
+is bit-identical to full-forward in fp32 (numerically equivalent in bf16). The cache is
+disabled automatically while steering is active, since steering re-derives the hidden
+states a cache would freeze.
+
+<details>
+<summary>All generation parameters</summary>
+
+```python
+model.generate(prompt=None, max_tokens=256, temperature=0.0, messages=None,
+               max_repeat=256, top_p=..., top_k=..., use_cache=True,
+               stop_sequences=..., stop_tokens=...)
+```
+
+`temperature=0` is greedy; a negative temperature raises. Pass either `prompt=` (a
+string) or `messages=` (chat turns — requires the tokenizer's chat template; base
+models have none, so use `prompt=`). A `GenerationConfig` bundles these defaults.
+`use_cache=False` forces a full re-forward each step (rarely needed).
+</details>
+
+---
+
+## Steering
+
+Steering edits activations at inference along the direction a probe encodes. Compute
+the per-class means once, then toggle steering per probe.
+
+```python
+from auto_chasm import SteeringConfig
+
+class_means = model.compute_class_means(data)   # {probe: {"mean_0": ..., "mean_1": ...}}
+model.enable_steering("is_question",
+                      config=SteeringConfig(method="push_to_mean", scale=6.0),
+                      class_means=class_means)
+print(model.generate("The weather today is", max_tokens=20))
+model.disable_steering("is_question")
+```
+
+`method` is `"nullify"` (remove the probe direction), `"push_to_mean"` (move toward a
+class), `"boundary"` (push across the decision boundary), or `"custom"` (your own
+`steer_fn`). `scale` sets the intensity; `scale=0` is a no-op.
+
+---
+
+## LoRA, checkpoints & layer sweeps
+
+**LoRA / PEFT** fine-tunes the base model cheaply alongside the probes.
+`prepare_for_joint_training` freezes the base and unfreezes the adapters and heads:
+
+```python
+from auto_chasm import LoraConfig
+
+model = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", lora=LoraConfig(rank=16, alpha=32))
+model.attach_probe(ProbeConfig(name="p", layers=[-1]))
+model.prepare_for_joint_training()   # LM loss now trains the LoRA adapters, the probe loss the head
+```
+
+`LoraConfig(peft_method=...)` selects `"lora"` (default), `"qlora"` (quantized), or
+`"dora"`; `target_modules=None` auto-detects the attention projections.
+
+**Checkpoints.** `save_checkpoint` writes one folder with the probe weights, any
+adapters, the steering geometry, and the config; `from_checkpoint` restores all of it:
+
+```python
+model.save_checkpoint("./runs/exp")
+restored = Model.from_checkpoint("./runs/exp")
+```
+
+**Layer sweeps.** To find *which layer* best encodes a property, `LayerSweep` trains
+one head per layer in a single frozen-base pass and keeps **each layer's head at its
+own best-validation step**:
+
+```python
+from auto_chasm import LayerSweep, Task
+
+sweep = LayerSweep(model, task=Task.binary())               # one head per layer, sized from the task
+result = sweep.run(train, val, test,
+                   loss_fn=JointLoss(weights={"lm_head": 0.0}),
+                   num_iters=200, eval_every=50)
+print(result.best_layer())      # the best layer by test-adjusted accuracy
+result.to_csv("sweep.csv")      # per-layer metrics; result.plot("sweep.png") draws the chart
+```
+
+<details>
+<summary>LayerSweep options (and per-layer selection metric)</summary>
+
+```python
+LayerSweep(model, *, task=None, out_features=None, module_spec=None, layers=None,
+           num_classes=None, score_metric="val_loss", higher_is_better=False,
+           ordinal_tol=1, eval_metrics_fn=None)
+```
+
+Pass a `task=` (which derives head width, classes, and metrics) *or* `out_features=`
+explicitly. `layers=None` sweeps every layer. `score_metric` picks each layer's best
+snapshot — `"val_loss"` (default), `"val_acc"`, `"val_macro_f1"`, … — paired with
+`higher_is_better` (set `True` for accuracy/F1). An unknown metric raises with the
+available names listed. `run(train, val, test, *, loss_fn, num_iters, eval_every)`.
+</details>
+
+---
+
+## Model stats & backends
+
+Inspect a model's architecture and parameter counts from the facade:
+
+```python
+model.stats()                         # {backend, num_layers, hidden_size, vocab_size,
+                                      #  num_attention_heads, intermediate_size,
+                                      #  num_parameters, num_trainable_parameters,
+                                      #  num_probes, probe_parameters}
+model.hidden_size                     # 576
+model.num_layers                      # 30
+model.num_parameters()                # total (base + probes)
+model.num_parameters(trainable=True)  # trainable only (after prepare_for_joint_training)
+```
+
+The same code runs on MLX (Apple silicon) and PyTorch (CUDA / CPU); the backend is
+auto-detected and can be forced with `backend_name="torch"`. A standard Hugging Face
+model (Llama, Qwen, Gemma, … architectures) loads on both — MLX through `mlx-lm`,
+PyTorch through `transformers`. `py.typed` ships full type information, so editors
+autocomplete the whole API.
+
+---
+
+## API at a glance
+
+| Import | What it is |
+|---|---|
+| `Model` | the model facade: probes, training prep, generation, steering, checkpoints, `stats()` |
+| `Dataset`, `Task` | labeled data (`from_texts`/`from_conversations`, `split`, `class_weights`, `infer_task`) and the inferred task |
+| `ProbeConfig`, `ModuleSpec`, `Probe` | describe, size, and hold a probe head |
+| `Trainer`, `SFTTrainer`, `TrainingConfig` | training loops and their config |
+| `JointLoss`, `ops` | the joint LM+probe loss and the backend-agnostic math facade |
+| `LayerSweep`, `SweepResult` | per-layer probing sweeps and their results |
+| `GenerationConfig`, `SteeringConfig`, `LoraConfig` | feature configs |
+| `classification_metrics`, `regression_metrics` | metric helpers |
+
+The runnable, backend-free scripts under [`demo/`](demo/) exercise each of these
+end-to-end.
+
+---
+
+## Development
+
+```bash
+uv sync --all-extras --group dev    # install with both backends + dev tools
+uv run pytest                       # test suite
+```
+
+Contributions keep the single-README documentation and the `demo/` scripts in sync
+with the code. Licensed under the MIT License.
+</content>

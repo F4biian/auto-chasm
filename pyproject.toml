@@ -1,0 +1,147 @@
+[project]
+name = "auto-chasm"
+version = "0.1.0"
+description = "Cross-platform research library for self-supervised internal state alignment and steerable generation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Fabian Ridder", email = "email@fabian-ridder.com" }]
+# Core depends only on the backend-agnostic numeric layer. A backend is chosen by
+# installing an extra — the two are EQUAL PEERS, neither is in core:
+#   pip install auto-chasm[mlx]     # Apple-silicon / MLX
+#   pip install auto-chasm[torch]   # CUDA / CPU / PyTorch
+# `import auto_chasm` succeeds with EITHER backend alone (a torch-only box never
+# imports MLX and vice versa) AND with NEITHER installed (loading a model then
+# raises a clear "install auto-chasm[mlx] or [torch]" error). Enforced by
+# test_backend_extras.
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.31.2", "mlx-lm>=0.31.3"]
+torch = ["torch>=2.0", "transformers>=4.40", "peft>=0.11"]
+
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+# The dev/test environment installs the MLX backend so the suite runs on Apple
+# silicon (this repo's primary dev machine); the `[torch]` extra covers the torch
+# half on Linux/CI. Backend packages live here (not in core) so `uv sync` keeps a
+# runnable backend without pinning one into the published core dependency set.
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "pre-commit>=3.7",
+    "mlx>=0.31.2",
+    "mlx-lm>=0.31.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+# Coverage is NOT measured on every local run / pre-commit: while `real_model`
+# tests are skipped (the default), the number understates real coverage, and
+# running the crash-prone MLX-on-Metal suite on every commit is unsafe. Enforce
+# the floor explicitly on a machine that can run everything:
+#   uv run pytest --run-real-model --cov=auto_chasm --cov-fail-under=75
+addopts = [
+    "--tb=short",
+    "-q",
+    "--strict-markers",
+]
+markers = [
+    "real_model: loads real pretrained weights (mlx-lm/transformers); slow and GPU-heavy. Skipped unless --run-real-model.",
+    "slow: long-running test.",
+]
+filterwarnings = [
+    # Python 3.12 deprecation for SWIG-generated C extension types in mlx-metal.
+    # These types don't set __module__; the fix must come from upstream MLX/SWIG.
+    "ignore::DeprecationWarning:importlib._bootstrap",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# `demo/` holds illustrative, run-verified scripts (not library code), so they are
+# exempt from lint/format — they're checked by actually running.
+exclude = [".venv", "__pycache__", ".git", "demo"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "D",    # pydocstyle — enforces Google-style docstrings (see convention below)
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "ARG",  # flake8-unused-arguments
+]
+ignore = [
+    "D100",  # Missing docstring in public module
+    "D104",  # Missing docstring in public package
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D102", "D103", "D107", "D101", "ARG001", "ARG002", "ARG005", "B017", "E741",
+    # Test-local naming conventions: the uppercase `test_BUG_*` / `test_OK_*` names
+    # trip N802, and short math-y locals (C = num classes, rM/rT = MLX/torch
+    # results) trip N803/N806.
+    "N802", "N803", "N806",
+    # Test docstrings are explanatory prose, not API contracts (missing-docstring
+    # rules D101-D107 are already relaxed above); don't enforce Google
+    # summary-line formatting on them.
+    "D205", "D209", "D403",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+explicit_package_bases = true
+no_site_packages = true
+warn_return_any = true
+warn_unused_configs = true
+show_error_codes = true
+exclude = [
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    "__pycache__",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "mlx.*",
+    "mlx_lm.*",
+    "safetensors.*",
+    "numpy.*",
+    "torch.*",
+    "transformers.*",
+    "peft.*",
+    "matplotlib.*",
+]
+ignore_missing_imports = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/auto_chasm"]
+
+# The sdist ships only the library and its user-facing collateral (source, tests,
+# demos, and packaging metadata), listed explicitly so nothing else is bundled.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/auto_chasm", "tests", "demo", "README.md", "LICENSE", "pyproject.toml"]

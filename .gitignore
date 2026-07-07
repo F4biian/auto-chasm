@@ -1,0 +1,37 @@
+# Keeps the working directory self-contained and prevents accidental commits of
+# large model artifacts, caches, and run outputs.
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.python-version
+
+# --- Build artifacts ---
+dist/
+build/
+
+# --- Virtualenv / tooling caches ---
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Secrets / environment ---
+.env
+
+# --- OS noise ---
+.DS_Store
+
+# --- Run outputs & model artifacts ---
+# Convention: write all training/inference outputs under ./runs/ (git-ignored).
+# The directories below are kept for backwards-compat with existing scripts.
+runs/
+checkpoints/
+ckpt/
+my_model/
+steering_data/
+demo/demo_digit_output/
