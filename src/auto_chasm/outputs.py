@@ -132,6 +132,56 @@ def _combine_ignore_mask(targets: Any, mask: Any | None) -> Any:
     return mx.logical_and(valid, mask != 0)
 
 
+def _to_f32(x: Any) -> Any:
+    """Cast ``x`` to float32 on its own backend (branch on the tensor type)."""
+    if hasattr(x, "device"):  # torch
+        import torch
+
+        return x.to(torch.float32)
+    import mlx.core as mx
+
+    return x.astype(mx.float32)
+
+
+def _weighted_masked_mean_bce(per_elem: Any, targets: Any, mask: Any, weights: Any) -> Any:
+    """Weighted masked mean of per-element BCE (the binary class-weight formula).
+
+    ``weights[0]`` scales the negative (0) class and ``weights[1]`` the positive
+    (1) class; a soft target ``t in [0, 1]`` gets the interpolated per-position
+    weight ``w_neg + (w_pos - w_neg)*t``.  Divides by the SUMMED weight (a true
+    weighted mean), guarding only the all-masked ``0/0`` with a tiny epsilon —
+    never clamping the denominator to ``1.0`` (which would rescale the loss when
+    the summed weights are ``< 1``).  A single :mod:`auto_chasm.ops` path, so MLX
+    and torch agree numerically.
+
+    Args:
+        per_elem: Per-element BCE (``reduction="none"``), any shape.
+        targets: Float targets in ``[0, 1]`` (``-100`` positions are excluded by
+            ``mask``), same shape as ``per_elem``.
+        mask: Boolean validity mask, same shape as ``per_elem``.
+        weights: ``[w_neg, w_pos]`` — exactly two entries (binary).
+
+    Returns:
+        Scalar weighted-mean BCE.
+
+    Raises:
+        ValueError: If ``len(weights) != 2``.
+    """
+    from auto_chasm import ops
+
+    if len(weights) != 2:
+        raise ValueError(
+            f"class_weights for a binary ('bce') probe needs exactly 2 entries "
+            f"[w_neg, w_pos]; got {len(weights)}."
+        )
+    w_neg, w_pos = float(weights[0]), float(weights[1])
+    # Clamp the target to [0, 1] so a masked -100 label cannot inflate the weight.
+    t01 = ops.clamp(_to_f32(targets), lo=0.0, hi=1.0)
+    w_each = w_neg + (w_pos - w_neg) * t01
+    ww = w_each * _to_f32(mask)
+    return ops.sum(per_elem * ww) / ops.clamp(ops.sum(ww), lo=1e-8)
+
+
 @dataclass
 class ProbeLossInfo:
     """Per-probe loss breakdown.
@@ -263,6 +313,7 @@ class ProbeOutput:
         self,
         targets: mx.array | torch.Tensor,
         mask: mx.array | torch.Tensor | None = None,
+        weights: Any = None,
     ) -> mx.array | torch.Tensor:
         """Binary cross-entropy loss with logits.
 
@@ -271,6 +322,10 @@ class ProbeOutput:
                 positions and is excluded from the mean (matches ``JointLoss``).
             mask: Optional boolean mask (same shape); falls back to the bound
                 :attr:`mask` (so a 2-arg custom loss respects padding automatically).
+            weights: Optional binary class weights ``[w_neg, w_pos]``.  When given,
+                each position's loss is scaled by ``w_neg`` (0-class) / ``w_pos``
+                (1-class) — the BCE counterpart of ``weighted_ce`` — and the mean is
+                a true weighted mean.  ``None`` (default) is the plain masked mean.
 
         Returns:
             Scalar BCE loss.
@@ -290,7 +345,10 @@ class ProbeOutput:
             bce = nn.losses.binary_cross_entropy(
                 self.logits, targets, reduction="none", with_logits=True
             )
-        return _masked_mean(bce, _combine_ignore_mask(targets, mask))
+        eff_mask = _combine_ignore_mask(targets, mask)
+        if weights is None:
+            return _masked_mean(bce, eff_mask)
+        return _weighted_masked_mean_bce(bce, targets, eff_mask, weights)
 
     def mse(
         self,

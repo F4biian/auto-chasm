@@ -21,6 +21,40 @@ _SEQ_CW_MSG = (
 )
 
 
+def _is_weightable_loss(spec: Any) -> bool:
+    """Whether ``class_weights`` apply to this loss spec (built-in ``ce``/``bce``).
+
+    A custom callable or a numeric (``mse``/``mae``) loss has no class structure to
+    weight, so it is not weightable. The loss router lower-cases string specs, so
+    ``"CE"``/``"BCE"`` match too.
+    """
+    return isinstance(spec, str) and spec.strip().lower() in ("ce", "bce")
+
+
+def check_class_weights_applicable(probe_name: str, spec: Any, class_weights: Any) -> None:
+    """Raise if ``class_weights`` is set on a probe whose loss cannot use it.
+
+    Setting class weights on an ``mse``/``mae``/custom probe would be a SILENT no-op,
+    so fail loudly at compute time — where the resolved per-probe loss is known —
+    naming the probe.
+
+    Args:
+        probe_name: The probe the weights were resolved for.
+        spec: The probe's resolved loss spec (a built-in name or a callable).
+        class_weights: The per-probe class weights, or ``None``.
+
+    Raises:
+        ValueError: If ``class_weights`` is set and ``spec`` is not ``ce``/``bce``.
+    """
+    if class_weights is not None and not _is_weightable_loss(spec):
+        kind = "a custom callable" if callable(spec) else f"'{spec}'"
+        raise ValueError(
+            f"class_weights was set for probe {probe_name!r}, but its loss is {kind}; "
+            "class weights only apply to the built-in 'ce'/'bce' losses. Pass a "
+            "{probe: weights} dict to weight only the ce/bce probes."
+        )
+
+
 def _require_resolved_class_weights(class_weights: Any) -> None:
     """Raise if class weights are still the unresolved ``"balanced"`` sentinel."""
     if isinstance(class_weights, str):
@@ -48,21 +82,22 @@ def _validate_class_weights(
         ``None``, ``"balanced"``, a ``list[float]``, or a ``{probe: value}`` dict.
 
     Raises:
-        ValueError: If no probe uses the built-in ``"ce"`` loss, an entry is
-            negative, or an unknown string is given.
+        ValueError: If no probe uses a built-in ``"ce"``/``"bce"`` loss, an entry
+            is negative, or an unknown string is given.
     """
     if class_weights is None:
         return None
 
-    # Match the loss router, which lower-cases string specs: "CE"/"Ce" are all CE.
-    def _is_ce(spec: Any) -> bool:
-        return isinstance(spec, str) and spec.strip().lower() == "ce"
-
-    ce_reachable = _is_ce(default_loss) or any(_is_ce(v) for v in probe_losses.values())
-    if not ce_reachable:
+    # Class weights apply to both CE (a per-class vector) and BCE (a [w_neg, w_pos]
+    # pair); the precise per-probe applicability is enforced at compute time by
+    # ``check_class_weights_applicable`` (in JointLoss._probe_term).
+    weightable = _is_weightable_loss(default_loss) or any(
+        _is_weightable_loss(v) for v in probe_losses.values()
+    )
+    if not weightable:
         raise ValueError(
-            "class_weights only affects the built-in 'ce' probe loss, but no "
-            "probe uses probe_loss='ce'. Set probe_loss='ce' (globally or "
+            "class_weights only affects the built-in 'ce'/'bce' probe losses, but "
+            "no probe uses probe_loss='ce' or 'bce'. Set one of those (globally or "
             "per-probe), or drop class_weights."
         )
 

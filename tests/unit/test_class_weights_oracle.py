@@ -208,9 +208,21 @@ def test_seq_level_class_weights_raises() -> None:
 
 
 def test_class_weights_with_custom_loss_raises() -> None:
-    """class_weights set with no 'ce' probe (a custom loss) raises at init."""
-    with pytest.raises(ValueError, match="no .*probe uses"):
-        JointLoss(losses={"p": lambda logits, t, m: logits.sum()}, class_weights=[1.0, 1.0, 1.0])
+    """class_weights on a probe whose loss is a custom callable raises at compute.
+
+    The default probe loss is the (weightable) ``bce``, so construction can't tell a
+    custom-loss-only probe apart from a to-be-attached bce probe; the precise
+    per-probe enforcement runs at compute time (where the resolved loss is known).
+    """
+    m = _model(3)
+    tm = _TrainableModel(m.model, m._probes)
+    loss = JointLoss(
+        weights={"lm_head": 0.0},
+        losses={"p": lambda logits, t, msk: logits.sum()},
+        class_weights=[1.0, 1.0, 1.0],
+    )
+    with pytest.raises(ValueError, match="class weights only apply"):
+        loss(tm, mx.array([[1, 2, 3, 4, 5]]), mx.array([[0, 1, 2, 1, 0]]), mx.array([[0, 4]]))
 
 
 def test_balanced_class_weights_formula() -> None:

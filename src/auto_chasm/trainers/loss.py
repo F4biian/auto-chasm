@@ -34,6 +34,7 @@ from auto_chasm.trainers._loss_ce import (
     _require_resolved_class_weights,
     _seq_target_and_mask,
     _validate_class_weights,
+    check_class_weights_applicable,
     weighted_ce,
 )
 from auto_chasm.trainers._loss_routing import (
@@ -94,13 +95,15 @@ class JointLoss:
             or ``(logits, target, mask)`` (the legacy signature).
         combine: A ``Callable[[LossTerms], LossTerm | scalar]`` for arbitrary
             composition.  Mutually exclusive with ``weights``.
-        class_weights: Per-CLASS weights for the built-in ``"ce"`` probe loss
-            (token-level only).  A flat sequence applies to every ``"ce"`` probe; a
-            ``{probe_name: sequence}`` dict targets individual heads.  Pass
-            ``"balanced"`` to have ``Trainer.train`` compute inverse-frequency
-            weights from the training data.  ``None`` (default) is plain unweighted
-            CE.  Raises if no probe uses ``"ce"``; using it on a sequence-level CE
-            probe raises at compute time.
+        class_weights: Per-CLASS weights for the built-in ``"ce"`` and ``"bce"``
+            probe losses.  For ``"ce"`` a length-``C`` vector scales each class
+            (token-level); for ``"bce"`` a length-2 ``[w_neg, w_pos]`` weights the
+            0- and 1-class (token- **or** sequence-level).  A flat sequence applies
+            to every weightable probe; a ``{probe_name: sequence}`` dict targets
+            individual heads.  Pass ``"balanced"`` to have ``Trainer.train`` compute
+            inverse-frequency weights from the training data.  ``None`` (default) is
+            unweighted.  Setting it on an ``"mse"``/``"mae"``/custom probe, or a
+            sequence-level ``"ce"`` probe, raises at compute time.
 
     Raises:
         ValueError: If both ``weights`` and ``combine`` are given, or if an unknown
@@ -361,6 +364,7 @@ class JointLoss:
         """
         spec = self._loss_spec_for(probe_name)
         class_weights = self._class_weights_for(probe_name)
+        check_class_weights_applicable(probe_name, spec, class_weights)
         probe_mask = _combine_masks(o.mask, shifted)
         probe.mask = probe_mask  # bind so a 2-arg custom loss can ``probe.reduce(...)``
 
@@ -374,6 +378,9 @@ class JointLoss:
             return self._call_custom(spec, probe, shifted, probe_mask)
         name = _canonical_loss_name(spec)
         if name == "bce":
+            if class_weights is not None:
+                _require_resolved_class_weights(class_weights)
+                return probe.bce(_as_float(shifted), mask=o.mask, weights=class_weights)
             return probe.bce(_as_float(shifted), mask=o.mask)
         if name == "mse":
             return _scalar_probe(probe).mse(_as_float(shifted), mask=o.mask)
@@ -420,6 +427,9 @@ class JointLoss:
             return self._call_custom(spec, pooled, seq_target, seq_valid)
         name = _canonical_loss_name(spec)
         if name == "bce":
+            if class_weights is not None:
+                _require_resolved_class_weights(class_weights)
+                return pooled.bce(seq_target, mask=seq_valid, weights=class_weights)
             return pooled.bce(seq_target, mask=seq_valid)
         if name == "mse":
             return pooled.mse(seq_target, mask=seq_valid)
