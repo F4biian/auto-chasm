@@ -36,6 +36,7 @@ from auto_chasm.trainers._loss_ce import (
     _validate_class_weights,
     check_class_weights_applicable,
     weighted_ce,
+    weighted_lm_ce,
 )
 from auto_chasm.trainers._loss_routing import (
     _probe_granularities,
@@ -50,6 +51,12 @@ if TYPE_CHECKING:
     import torch
 
 logger = get_logger(__name__)
+
+# Back-compat re-export: the legacy keyword adapter moved to _loss_legacy.py
+# (file-length cap); sft.py / trainable.py / tests import it from here.
+from auto_chasm.trainers._loss_legacy import (  # noqa: E402
+    _joint_loss_from_legacy as _joint_loss_from_legacy,  # explicit re-export
+)
 
 LossFn = Callable[[Any, Any, Any, Any], tuple[Any, Any, dict[str, Any]]]
 
@@ -282,12 +289,15 @@ class JointLoss:
         granularities = _probe_granularities(model)
         # A labels dict whose keys match NO probe silently skips every probe term
         # (loss becomes just the LM term, or a constant 0 in pure-probe mode).
-        # That is almost always a probe-name typo, so surface it.
-        if isinstance(labels, dict) and labels and set(labels).isdisjoint(o.probes):
+        # That is almost always a probe-name typo, so surface it. The reserved
+        # "lm_head" key is the per-token LM WEIGHT channel, not a probe target —
+        # a pure-SFT-with-weights dataset must not trip this warning.
+        probe_label_keys = set(labels) - {LM_HEAD} if isinstance(labels, dict) else set()
+        if isinstance(labels, dict) and probe_label_keys and probe_label_keys.isdisjoint(o.probes):
             logger.warning(
                 "labels dict keys %s match none of the attached probes %s; every "
                 "probe term is skipped. Check for a probe-name typo.",
-                sorted(labels),
+                sorted(probe_label_keys),
                 sorted(o.probes),
             )
 
@@ -295,10 +305,26 @@ class JointLoss:
 
         # LM term.  Skip only in weighted-sum mode with weight <= 0 (combine may
         # still reference it, so it is always computed when combine is given).
+        # The reserved labels["lm_head"] channel carries PER-TOKEN weights
+        # (1=train, 0=mask, negative=unlearn; -100=unspecified->1) — see
+        # ``weighted_lm_ce``. With no channel this is the plain masked-mean CE.
+        lm_weights = labels.get(LM_HEAD) if isinstance(labels, dict) else None
         if self._combine is not None or self._weight_for(LM_HEAD) > 0:
             lm_spec = self._losses.get(LM_HEAD)
+            if lm_spec is not None and lm_weights is not None:
+                raise ValueError(
+                    "The data carries a per-token labels['lm_head'] weight channel, "
+                    "but losses['lm_head'] overrides the LM loss with a custom "
+                    "callable — the weights would be silently ignored. Apply them "
+                    "inside your callable, or drop one of the two."
+                )
             if lm_spec is None:
-                terms[LM_HEAD] = LossTerm(o.lm_ce)
+                if lm_weights is None:
+                    terms[LM_HEAD] = LossTerm(o.lm_ce)
+                else:
+                    terms[LM_HEAD] = LossTerm(
+                        weighted_lm_ce(o.lm_logits, o.targets, o.mask, lm_weights[:, 1:])
+                    )
             else:
                 terms[LM_HEAD] = LossTerm(self._lm_term(lm_spec, o))
 
@@ -502,50 +528,6 @@ class JointLoss:
 # --------------------------------------------------------------------------- #
 # Free helpers (module-level so subclasses and custom losses can reuse them).  #
 # --------------------------------------------------------------------------- #
-
-
-def _joint_loss_from_legacy(
-    *,
-    lm_weight: float = 1.0,
-    probe_weight: float = 1.0,
-    probe_loss: str | Callable[..., Any] = "bce",
-    probe_weights: dict[str, float] | None = None,
-    probe_losses: dict[str, str | Callable[..., Any]] | None = None,
-    class_weights: Any = None,
-) -> JointLoss:
-    """Build a :class:`JointLoss` from the pre-Phase-3b keyword arguments (a shim).
-
-    Phase 3b-2 wires ``trainer.py``/``model.py``/``sft.py`` onto the new
-    ``weights=``/``losses=``/``combine=`` API and migrates the remaining tests; until
-    then this adapter lets ``make_joint_loss`` and ``SFTTrainer`` keep constructing a
-    ``JointLoss`` without the removed ``lm_weight``/``probe_weight``/``probe_loss``
-    constructor.  The old per-probe ``probe_weights``/``probe_losses`` dicts map
-    directly onto the new per-term ``weights``/``losses`` dicts.
-
-    Args:
-        lm_weight: Weight for the LM cross-entropy term.
-        probe_weight: The default weight for probes not listed in ``probe_weights``
-            (carried onto the loss's internal ``_default_weight``).
-        probe_loss: The default loss for probes not listed in ``probe_losses``
-            (carried onto the loss's internal ``_default_loss``).
-        probe_weights: Per-probe weight overrides.
-        probe_losses: Per-probe loss overrides.
-        class_weights: Per-class weights for the built-in ``"ce"`` loss.
-
-    Returns:
-        A ``JointLoss`` configured for the equivalent behavior.
-    """
-    weights: dict[str, float] = {LM_HEAD: float(lm_weight)}
-    weights.update(probe_weights or {})
-    # Build WITHOUT class_weights, set the old global defaults, THEN apply class
-    # weights — so they validate against the real default loss (probe_loss), not the
-    # "bce" JointLoss default (else make_joint_loss(probe_loss="ce", class_weights=...)
-    # wrongly raised "no probe uses 'ce'").
-    jl = JointLoss(weights=weights, losses=probe_losses)
-    jl._default_loss = probe_loss
-    jl._default_weight = float(probe_weight)
-    jl.set_class_weights(class_weights)
-    return jl
 
 
 def _canonical_loss_name(spec: str) -> str:

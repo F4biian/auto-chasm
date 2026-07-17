@@ -126,10 +126,23 @@ def test_infer_dict_labels_per_probe() -> None:
 
 
 def test_infer_dict_labels_requires_probe_name() -> None:
-    """A dict-labelled dataset with no probe_name is ambiguous → raises."""
-    ds = _ds([[0, 1]], probe="cefr")
+    """probe_name is required only when the dict is ACTUALLY ambiguous (>= 2 probes).
+
+    A single-probe dict resolves without probe_name (this became the common
+    shape once the reserved "lm_head" LM-weight channel forced dict labels);
+    two or more probe keys are ambiguous and still raise.
+    """
+    single = _ds([[0, 1]], probe="cefr")
+    assert single.infer_task() == single.infer_task("cefr")  # unambiguous: no raise
+
+    two_probe = Dataset([{"tokens": [0, 1], "labels": {"cefr": [0, 1], "quality": [1, 0]}}])
     with pytest.raises(ValueError, match="per-probe"):
-        ds.infer_task()
+        two_probe.infer_task()
+
+    # The reserved lm_head WEIGHT channel is not a probe: it must not create
+    # ambiguity, and it must never be inferred AS the task labels.
+    with_lm = Dataset([{"tokens": [0, 1], "labels": {"cefr": [0, 1], "lm_head": [1.0, 0.0]}}])
+    assert with_lm.infer_task() == single.infer_task("cefr")
 
 
 def test_infer_empty_labels_raises() -> None:

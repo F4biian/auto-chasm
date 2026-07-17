@@ -227,7 +227,15 @@ def _build_label_output(
             # single-list contract). Broadcast it to each probe rather than
             # dropping it to an all-(-100) row, which silently discarded its
             # supervision when batched alongside a per-probe dict sample.
-            per = [lab.get(name, []) if isinstance(lab, dict) else lab for lab in labels_list]
+            # EXCEPT the reserved "lm_head" key: that is the per-token LM WEIGHT
+            # channel, and broadcasting a probe's CLASS labels into it would
+            # silently mask/unlearn arbitrary tokens. A sample without the
+            # channel pads to -100, which the LM loss reads as "unspecified ->
+            # default weight 1.0" (normal training).
+            per = [
+                lab.get(name, []) if isinstance(lab, dict) else ([] if name == "lm_head" else lab)
+                for lab in labels_list
+            ]
             out[name] = _pad_label_matrix(per, truncated, batch_size, max_length, label_pad)
         return out
     return _pad_label_matrix(labels_list, truncated, batch_size, max_length, label_pad)

@@ -234,6 +234,77 @@ def _class_weight_vector(weights: Sequence[float], ref: Any) -> Any:
     return mx.array(list(weights)).astype(mx.float32)
 
 
+def weighted_lm_ce(
+    lm_logits: Any,
+    targets: Any,
+    mask: Any,
+    token_weights: Any,
+) -> Any:
+    """Per-token-weighted language-model cross-entropy (both backends).
+
+    Each target token's CE is scaled by its weight from the data's reserved
+    ``labels["lm_head"]`` channel:
+
+    - ``1.0`` — normal training (the default),
+    - ``0.0`` — masked: the token contributes nothing (like ``-100`` labels),
+    - negative (e.g. ``-1.0``) — **gradient ascent** on that token: training
+      actively DECREASES its likelihood ("unlearning" / negated CE, as used in
+      the machine-unlearning literature). Magnitude scales the push.
+    - ``-100`` (the ignore/padding sentinel) — treated as the DEFAULT ``1.0``:
+      it marks "weight not specified" (padding, or a sample without an
+      ``lm_head`` channel batched next to samples with one), never "mask".
+      Positions outside the valid window are excluded by ``mask`` regardless.
+
+    The result is a true weighted mean: ``sum(w * ce * mask) /
+    max(sum(|w| * mask), eps)`` — with all-``1.0`` weights this reduces exactly
+    to the unweighted ``JointOutputs.lm_ce``. The ``|w|`` denominator measures
+    the amount of supervision signal (a masked token contributes none; an
+    unlearned token contributes as much as a trained one).
+
+    **Caveat (documented, by design):** negated CE is unbounded below — pushing
+    an already-unlikely token further down keeps "improving" the loss. Keep
+    negative magnitudes small (``-1``), monitor the LM loss on ordinary tokens,
+    and prefer few targeted spans over broad ones.
+
+    Args:
+        lm_logits: LM logits ``[B, T, V]`` (already next-token aligned).
+        targets: Target token ids ``[B, T]``.
+        mask: Boolean valid-window mask ``[B, T]``.
+        token_weights: Per-target-token weights ``[B, T]`` (the shifted
+            ``labels["lm_head"][:, 1:]`` channel; ``-100`` = unspecified).
+
+    Returns:
+        Scalar weighted-mean CE (fp32 accumulation).
+    """
+    from auto_chasm import ops
+
+    # Per-token CE via the framework kernel (an ops one-hot over the ~100k-token
+    # vocabulary would materialize a [B, T, V] intermediate — far too large).
+    if tensor_backend(lm_logits) == "torch":
+        import torch
+        from torch.nn import functional
+
+        ce_each = functional.cross_entropy(
+            lm_logits.reshape(-1, lm_logits.shape[-1]),
+            targets.reshape(-1).long(),
+            reduction="none",
+        ).reshape(targets.shape)
+        w_raw = token_weights.to(torch.float32)
+    else:
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        ce_each = nn.losses.cross_entropy(lm_logits, targets)
+        w_raw = token_weights.astype(mx.float32)
+
+    ones = _to_float32(w_raw * 0.0 + 1.0)  # ones_like, backend-agnostic
+    w = ops.where(w_raw == -100.0, ones, w_raw)  # -100 = "unspecified" -> default 1.0
+    m = _to_float32(mask)
+    num = ops.sum(_to_float32(ce_each) * w * m)
+    denom = ops.clamp(ops.sum(ops.abs(w) * m), lo=1e-8)
+    return num / denom
+
+
 def _seq_target_and_mask(labels_shifted: Any, probe_mask: Any) -> tuple[Any, Any]:
     """Derive a per-sequence target and validity mask (backend-agnostic).
 

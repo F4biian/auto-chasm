@@ -214,6 +214,60 @@ text's tokens are never divided across train and val. `class_weights` feeds
 automatically (used by [`LayerSweep`](#lora-checkpoints--layer-sweeps)).
 </details>
 
+### Per-token LM-loss weights — mask & unlearn tokens
+
+The reserved label key **`"lm_head"`** controls how much each token trains the
+**language-model head** (probe labels are untouched): weight `1.0` = normal
+training, `0.0` = masked (not trained, like `-100`), **negative = actively
+DECREASE the token's likelihood** (gradient ascent on the CE — "unlearning";
+`-1.0` is a standard push, `-5.0` a stronger one). Two mutually exclusive ways
+to declare it:
+
+```python
+# 1) Role-based — the chat-SFT switch. Train the LM only on assistant tokens
+#    (user/system tokens get weight 0). Chat/instruct data only — roles must exist.
+data = Dataset.from_conversations(conversations, model.tokenizer,
+                                  lm_train_on="assistant")     # or ("assistant", "system")
+
+# 2) Explicit per-message specs — full control, all forms mixable:
+conversations = [[
+    {"role": "user", "content": "Question ..."},                       # no specs: weight 1.0
+    {"role": "assistant", "content": "Answer with a hallucination.",
+     "labels": {
+         "halluc":  [{"start": 14, "end": 31, "label": 1}],            # a probe, as usual
+         "lm_head": [                                                  # the LM-weight channel
+             {"start": 14, "end": 31, "weight": -1.0},                 # char span -> unlearn
+             {"text": "hallucination", "weight": 0.0},                 # every occurrence -> mask
+             {"regex": r"\d{4}", "weight": 0.0},                       # every match
+             {"token_ids": [1234, 567], "weight": -2.0},               # token subsequence
+         ],
+     }},
+]]
+data = Dataset.from_conversations(conversations, model.tokenizer)
+```
+
+That is the whole API — `Trainer`/`JointLoss` pick the channel up from the data
+automatically (no loss configuration). Semantics worth knowing:
+
+- **Default = today's behavior.** Without `lm_train_on`/specs nothing changes:
+  every token trains the LM head (there is NO automatic user-token masking).
+- Overlapping specs aggregate with **min** — the most aggressive intervention
+  wins (`-5 < -1 < 0 < 1`).
+- `lm_train_on=` **and** explicit specs together raise `ValueError` (two
+  competing masking sources would be ambiguous). To combine role masking with
+  span weights, express the roles as spans too — e.g. a
+  `{"start": 0, "end": len(content), "weight": 0}` span on each non-assistant
+  message.
+- With an active channel, `labels` is always a per-probe dict + the float
+  `"lm_head"` array; attach probes under the same names your spans use.
+- A custom `losses={"lm_head": fn}` override + the channel raises (the weights
+  would be silently ignored otherwise).
+- **Unlearning caveat:** negated CE is unbounded below — an already-unlikely
+  token can be pushed down forever, and too-strong pushes destabilize training.
+  Keep magnitudes small (`-1`), watch the LM loss on ordinary tokens, and
+  prefer targeted spans. (The bounded alternative from the literature,
+  unlikelihood training `-log(1-p)`, is not implemented.)
+
 ---
 
 ## Probes

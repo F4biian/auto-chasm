@@ -6,12 +6,21 @@ and wrapping HuggingFace ``datasets`` objects.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Sequence
 from typing import Any
 
-from auto_chasm.config import ProbeConfig
+from auto_chasm._data_linking import (  # noqa: F401  (public re-exports)
+    JointDataset,
+    collate_batches,
+    link_columns,
+)
+from auto_chasm._lm_weights import (
+    _lm_specs_of,
+    _lm_weights_for_message,
+    _normalize_lm_train_on,
+)
+from auto_chasm.config import LM_HEAD
 from auto_chasm.logger import get_logger
-from auto_chasm.utils import tensor_backend
 
 logger = get_logger(__name__)
 
@@ -38,181 +47,6 @@ def _label_number(value: Any) -> int | float:
     """
     number = float(value)
     return int(number) if number.is_integer() else number
-
-
-def link_columns(
-    batch: dict[str, Any],
-    probes: list[ProbeConfig],
-    column_map: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Auto-link dataset columns to probe label keys.
-
-    For each probe, looks for a column named ``{probe_name}_labels``
-    (or a custom mapping) in the batch and copies it to ``probe_labels``
-    under the probe's name.
-
-    Args:
-        batch: A single batch dict from the dataloader.
-        probes: List of probe configurations.
-        column_map: Optional ``{probe_name: column_name}`` overrides.
-
-    Returns:
-        The batch with an added ``"probe_labels"`` dict.
-    """
-    column_map = column_map or {}
-    probe_labels: dict[str, Any] = {}
-
-    for probe in probes:
-        col_name = column_map.get(probe.name, f"{probe.name}_labels")
-        if col_name in batch:
-            probe_labels[probe.name] = batch[col_name]
-        else:
-            logger.debug(
-                "Column %r not found in batch for probe %r; skipping.",
-                col_name,
-                probe.name,
-            )
-
-    batch["probe_labels"] = probe_labels
-    return batch
-
-
-class JointDataset:
-    """Wraps a HuggingFace dataset to auto-link columns for joint training.
-
-    Args:
-        dataset: The underlying HuggingFace ``Dataset``.
-        probes: List of probe configurations.
-        column_map: Optional column name overrides.
-        tokenizer: Tokenizer for text columns (if pre-tokenization needed).
-    """
-
-    def __init__(
-        self,
-        dataset: Any,
-        probes: list[ProbeConfig],
-        column_map: dict[str, str] | None = None,
-        tokenizer: Any = None,
-    ) -> None:
-        """Initialize the probe dataset wrapper."""
-        self.dataset = dataset
-        self.probes = probes
-        self.column_map = column_map or {}
-        self.tokenizer = tokenizer
-        self._validate_probe_columns()
-
-    def _validate_probe_columns(self) -> None:
-        """Warn loudly if a probe's label column is absent from the dataset.
-
-        A column missing for *every* sample means the probe would silently
-        train on no labels — almost always a typo in the column name.  This
-        check fails loud (a warning) rather than letting it pass silently.
-        """
-        columns: set[str] = set()
-        column_names = getattr(self.dataset, "column_names", None)
-        if column_names:
-            columns = set(column_names)
-        elif len(self.dataset) > 0:
-            first = self.dataset[0]
-            if isinstance(first, dict):
-                columns = set(first.keys())
-        if not columns:
-            return
-        for probe in self.probes:
-            col = self.column_map.get(probe.name, f"{probe.name}_labels")
-            if col not in columns:
-                logger.warning(
-                    "Probe %r expects label column %r, which is not present in the "
-                    "dataset columns %s. This probe would train on NO labels — check "
-                    "for a typo or pass column_map={%r: <column>}.",
-                    probe.name,
-                    col,
-                    sorted(columns),
-                    probe.name,
-                )
-
-    def __len__(self) -> int:
-        """Return the number of samples."""
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        """Return a single linked sample by index."""
-        item = self.dataset[idx]
-        return link_columns(item, self.probes, self.column_map)
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        """Iterate over all linked samples."""
-        for i in range(len(self)):
-            yield self[i]
-
-
-def collate_batches(
-    batches: list[dict[str, Any]],
-    _probes: list[ProbeConfig],
-) -> dict[str, Any]:
-    """Collate a list of samples into a single batch.
-
-    Stacks tensor fields and groups probe labels under a ``"probe_labels"`` key.
-
-    Args:
-        batches: List of individual samples.
-        _probes: List of probe configurations (currently unused).
-
-    Returns:
-        A single batch dict ready for the training step.
-    """
-    if not batches:
-        return {}
-
-    keys = batches[0].keys()
-    result: dict[str, Any] = {}
-
-    for key in keys:
-        if key == "probe_labels":
-            continue
-        values = [b[key] for b in batches]
-        result[key] = _stack_backend(values)
-
-    probe_labels: dict[str, list[Any]] = {}
-    for b in batches:
-        pl = b.get("probe_labels", {})
-        for name, label in pl.items():
-            probe_labels.setdefault(name, []).append(label)
-
-    result["probe_labels"] = {}
-    for name, labels in probe_labels.items():
-        result["probe_labels"][name] = _stack_backend(labels)
-
-    return result
-
-
-def _stack_backend(values: list[Any]) -> Any:
-    """Stack a list of tensors along a new leading axis, dispatched by type.
-
-    Dispatch is by the concrete tensor type (never by import availability),
-    so a torch batch is not silently routed through MLX on a machine where
-    both frameworks are installed.  Non-tensor values are returned as-is.
-
-    Args:
-        values: List of same-typed tensors (or arbitrary values).
-
-    Returns:
-        A stacked tensor, or the original list if the values are not tensors.
-    """
-    if not values:
-        return values
-    if tensor_backend(values[0]) == "torch":
-        import torch
-
-        if isinstance(values[0], torch.Tensor):
-            return torch.stack(values, dim=0)
-        return values
-    import mlx.core as mx
-
-    try:
-        return mx.stack(values, axis=0)
-    except (TypeError, ValueError):
-        return values
 
 
 def _encode_with_offsets(
@@ -395,6 +229,7 @@ def build_dataset(
     offset: int = 0,
     aggregation: str | Callable[..., Any] = "max",
     default_label: float | None = None,
+    lm_train_on: str | Sequence[str] = "all",
 ) -> list[dict[str, Any]]:
     """Build a training dataset from conversations with span labels.
 
@@ -434,6 +269,28 @@ def build_dataset(
     probe (``-100``) for its tokens; heads never bleed into one another. The
     ``Trainer`` and :class:`~auto_chasm.JointLoss` route the dict automatically.
 
+    **Per-token LM-loss weights (masking & unlearning).** The reserved label key
+    ``"lm_head"`` controls how much each token trains the LANGUAGE-MODEL head
+    (see ``JointLoss``/``weighted_lm_ce``): weight ``1.0`` = normal training,
+    ``0.0`` = masked (like ``-100``), negative = actively DECREASE the token's
+    likelihood (gradient ascent / unlearning; e.g. ``-1.0``, or ``-5.0`` for a
+    stronger push). Two mutually exclusive ways to declare it:
+
+    - ``lm_train_on=`` — role-based baseline: e.g. ``"assistant"`` trains the LM
+      only on assistant-message tokens (weight 1), masking every other role
+      (weight 0). The common chat-SFT switch.
+    - Explicit per-message specs in ``msg["labels"]["lm_head"]`` — full control:
+      ``{"start", "end", "weight"}`` char spans, ``{"text": ..., "weight"}``
+      substring occurrences, ``{"regex": ..., "weight"}`` matches, or
+      ``{"token_ids": [...], "weight"}`` token subsequences. Uncovered tokens
+      default to weight 1; overlaps aggregate with **min** (unlearn beats mask
+      beats train).
+
+    Passing BOTH raises ``ValueError`` — two competing masking sources would be
+    ambiguous. To combine role masking with span weights, express the roles as
+    spans too (e.g. a ``{"start": 0, "end": len(content), "weight": 0}`` span on
+    each non-assistant message).
+
     Args:
         conversations: List of conversations.  Each conversation is a
             list of message dicts with keys ``"role"``, ``"content"``,
@@ -441,13 +298,17 @@ def build_dataset(
         tokenizer: Tokenizer with an ``encode(text)`` method.
         offset: Shift labels by this many positions.  ``1`` shifts
             right (for next-token prediction), ``-1`` shifts left.
-            ``0`` means no shift.  Default ``0``.
+            ``0`` means no shift.  Default ``0``.  Applies to PROBE labels
+            only, never to the ``"lm_head"`` weight channel.
         aggregation: Span aggregation strategy (passed to
             :func:`span_labels_to_tokens`).  Default ``"max"``.
         default_label: Label for tokens inside a labeled message that no span
             covers. ``None`` (the default) masks them with :data:`IGNORE_INDEX`
             (``-100``) so only explicitly-marked tokens train; pass ``0`` (or
             any value) to treat unmarked tokens as that class instead.
+        lm_train_on: ``"all"`` (default — every token trains the LM head), a
+            role name, or a sequence of role names whose tokens train (all
+            other roles are LM-masked). See above.
 
     Returns:
         List of ``{"tokens": list[int], "labels": ...}`` dicts ready for the
@@ -456,6 +317,14 @@ def build_dataset(
         (``-100`` for probes a given sample doesn't label); if it names **one**
         probe, ``labels`` is a per-token list (a shared stream feeding the head).
         Unspecified positions are ``-100`` (masked); spans supply the rest.
+        When an LM-weight channel is active (either mechanism), ``labels`` is
+        ALWAYS a dict with the extra ``"lm_head"`` float array — probe labels
+        are then keyed by their probe names, so attach probes under the SAME
+        names the spans use.
+
+    Raises:
+        ValueError: If ``lm_train_on`` is combined with explicit ``"lm_head"``
+            specs, or a spec is malformed (see :func:`_lm_weights_for_message`).
     """
     masked = IGNORE_INDEX
     # Fill for unmarked tokens *inside* a labeled message: mask by default
@@ -469,13 +338,28 @@ def build_dataset(
     # a sample that labels only one probe can never broadcast its labels onto another
     # head at batch time. A single global probe keeps the plain-list "shared label"
     # contract (from_texts / LayerSweep, where one label stream feeds every head).
+    # The reserved "lm_head" key is the per-token LM WEIGHT channel, not a probe.
     conversations = list(conversations)
     global_probes: set[str] = set()
+    any_lm_specs = False
     for conversation in conversations:
         for msg in conversation:
-            global_probes.update(n for n, spans in msg.get("labels", {}).items() if spans)
+            global_probes.update(
+                n for n, spans in msg.get("labels", {}).items() if spans and n != LM_HEAD
+            )
+            any_lm_specs = any_lm_specs or bool(_lm_specs_of(msg))
     multi_probe = len(global_probes) >= 2
     global_names = sorted(global_probes)
+
+    lm_roles = _normalize_lm_train_on(lm_train_on)
+    if lm_roles is not None and any_lm_specs:
+        raise ValueError(
+            f"lm_train_on={lm_train_on!r} AND explicit labels['{LM_HEAD}'] specs were "
+            "both given — two competing sources of LM masking would be ambiguous. "
+            "Either drop lm_train_on (and express the role masking as weight-0 spans "
+            "on the messages to exclude), or remove the explicit specs."
+        )
+    emit_lm = lm_roles is not None or any_lm_specs
 
     for conversation in conversations:
         all_tokens: list[int] = []
@@ -483,18 +367,37 @@ def build_dataset(
         # label array is built from the SAME encoding the tokens come from.
         msg_infos: list[tuple[list[int], list[tuple[int, int]], dict[str, Any]]] = []
         conv_probes: set[str] = set()
+        lm_weights: list[float] = []
         for msg in conversation:
             token_ids, token_offsets = _encode_with_offsets(msg["content"], tokenizer)
             msg_tokens = token_ids if token_ids is not None else tokenizer.encode(msg["content"])
             msg_labels_dict = msg.get("labels", {})
             all_tokens.extend(msg_tokens)
             msg_infos.append((msg_tokens, token_offsets, msg_labels_dict))
-            conv_probes.update(name for name, spans in msg_labels_dict.items() if spans)
+            conv_probes.update(
+                name for name, spans in msg_labels_dict.items() if spans and name != LM_HEAD
+            )
+            if emit_lm:
+                baseline = 1.0 if lm_roles is None or msg.get("role") in lm_roles else 0.0
+                lm_weights.extend(_lm_weights_for_message(msg, msg_tokens, token_offsets, baseline))
 
-        # In a multi-probe dataset build EVERY global probe's array (so this sample
-        # emits the complete dict, -100 for probes it doesn't label); otherwise just
-        # this conversation's single probe.
-        probe_names = global_names if multi_probe else sorted(conv_probes)
+        if emit_lm and lm_roles is not None and all_tokens and not any(lm_weights):
+            logger.warning(
+                "lm_train_on=%r matched NO message role in a conversation (roles seen: "
+                "%s) — its LM weights are all 0, so it trains the LM head on nothing.",
+                lm_train_on,
+                sorted({str(m.get("role")) for m in conversation}),
+            )
+
+        # Whenever labels are emitted as a dict (multi-probe, or the LM-weight
+        # channel is active) build EVERY global probe's array — a sample that
+        # does not label a probe (including a deliberately EMPTY span list)
+        # emits an all-(-100) row for it, so the dict's keys never flicker
+        # from sample to sample (a batch of only unlabeled samples would
+        # otherwise be missing the probe's key entirely, which per-probe
+        # consumers cannot distinguish from "this probe does not exist").
+        # Otherwise: just this conversation's single probe, as a plain list.
+        probe_names = global_names if (multi_probe or emit_lm) else sorted(conv_probes)
 
         # Build one full-length label array per probe (independent targets). A
         # message that does not label a probe masks it (-100) for those tokens,
@@ -514,7 +417,12 @@ def build_dataset(
             per_probe[name] = _shift_and_fit(seq, offset, len(all_tokens), masked)
 
         labels: Any
-        if multi_probe:
+        if emit_lm:
+            # An active LM-weight channel forces dict labels: probe arrays keyed
+            # by their probe names (attach probes under those names) + the
+            # reserved float "lm_head" weights (offset never applies to it).
+            labels = {**per_probe, LM_HEAD: lm_weights}
+        elif multi_probe:
             labels = per_probe  # full {probe: labels} dict; -100 for probes not labeled here
         elif conv_probes:
             labels = per_probe[sorted(conv_probes)[0]]  # single global probe: shared list
@@ -613,7 +521,14 @@ def _sample_label_list(sample: Any, probe_name: str | None) -> list[Any]:
     else:
         return []
     if isinstance(labels, dict):
+        # The reserved "lm_head" key is the per-token LM WEIGHT channel, never a
+        # probe's class labels — exclude it. A dict that then holds exactly ONE
+        # probe is unambiguous without probe_name (the common single-probe +
+        # lm-weights case).
+        probe_keys = [k for k in labels if k != LM_HEAD]
         if probe_name is None:
+            if len(probe_keys) == 1:
+                return list(labels[probe_keys[0]])
             raise ValueError(
                 "This dataset has per-probe (dict) labels; pass probe_name= to "
                 "select which head's class distribution to count."

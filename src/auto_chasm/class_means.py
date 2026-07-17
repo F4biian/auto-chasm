@@ -58,6 +58,39 @@ def compute_class_means(
     return result
 
 
+def _labels_for_probe(raw_labels: Any, probe_name: str) -> Any:
+    """Select a probe's label array from a per-probe dict batch (or pass through).
+
+    A dataset carrying the reserved ``"lm_head"`` LM-weight channel (or several
+    probes) batches labels as a ``{name: array}`` dict; the class means must be
+    computed from THIS probe's own labels — never the LM weights or another
+    head's classes.
+
+    Args:
+        raw_labels: The batch labels — a numpy array or a ``{name: array}`` dict.
+        probe_name: The probe whose labels to select.
+
+    Returns:
+        The label array for this probe.
+
+    Raises:
+        KeyError: If ``raw_labels`` is a dict without this probe's key (and no
+            unambiguous single-probe fallback exists).
+    """
+    if not isinstance(raw_labels, dict):
+        return raw_labels
+    if probe_name in raw_labels:
+        return raw_labels[probe_name]
+    probe_keys = [k for k in raw_labels if k != "lm_head"]
+    if len(probe_keys) == 1:  # single-probe data labeled under a different name
+        return raw_labels[probe_keys[0]]
+    raise KeyError(
+        f"compute_class_means: batch labels are a per-probe dict without a "
+        f"{probe_name!r} entry (keys: {sorted(raw_labels)}); cannot pick the "
+        "class labels unambiguously."
+    )
+
+
 def _compute_mlx(
     model: Any,
     probe: Any,
@@ -79,7 +112,7 @@ def _compute_mlx(
         dataset, batch_size, max_seq_length, loop=False
     ):
         tokens = mx.array(raw_tokens)
-        labels = mx.array(raw_labels)
+        labels = mx.array(_labels_for_probe(raw_labels, probe.name))
         probe.clear_captured()
         model.forward(tokens[:, :-1])
         captured = probe.get_captured_states()
@@ -127,7 +160,7 @@ def _compute_torch(
     ):
         device = next(model.model.parameters()).device
         tokens = torch.from_numpy(raw_tokens).long().to(device)
-        labels = torch.from_numpy(raw_labels).long().to(device)
+        labels = torch.from_numpy(_labels_for_probe(raw_labels, probe.name)).long().to(device)
         lengths_t = torch.from_numpy(lengths).to(device)
         probe.clear_captured()
         with torch.no_grad():
