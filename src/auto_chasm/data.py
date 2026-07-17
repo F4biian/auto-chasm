@@ -270,26 +270,39 @@ def build_dataset(
     ``Trainer`` and :class:`~auto_chasm.JointLoss` route the dict automatically.
 
     **Per-token LM-loss weights (masking & unlearning).** The reserved label key
-    ``"lm_head"`` controls how much each token trains the LANGUAGE-MODEL head
-    (see ``JointLoss``/``weighted_lm_ce``): weight ``1.0`` = normal training,
-    ``0.0`` = masked (like ``-100``), negative = actively DECREASE the token's
-    likelihood (gradient ascent / unlearning; e.g. ``-1.0``, or ``-5.0`` for a
-    stronger push). Two mutually exclusive ways to declare it:
+    ``"lm_head"`` controls how each token trains the LANGUAGE-MODEL head
+    (see ``JointLoss``/``weighted_lm_ce``): weight ``1.0`` = normal training
+    (``-log p``), ``0.0`` = masked (like ``-100``), negative = **unlikelihood
+    training** (Welleck et al. 2019, arXiv:1908.04319) — ``|w| * -log(1 - p)``,
+    which DECREASES the token's likelihood with ``|w|`` as the paper's
+    ``alpha`` (e.g. ``-1.0``, or ``-5.0`` for five times the pressure). Two
+    ways to declare it, usable TOGETHER (see the composition rule below):
 
     - ``lm_train_on=`` — role-based baseline: e.g. ``"assistant"`` trains the LM
-      only on assistant-message tokens (weight 1), masking every other role
-      (weight 0). The common chat-SFT switch.
+      only on assistant-message tokens (weight 1) and masks **every other role**
+      (weight 0) — including ``system``, not just ``user``. The common chat-SFT
+      switch. Pass a sequence to keep more than one role, e.g.
+      ``("assistant", "system")``.
     - Explicit per-message specs in ``msg["labels"]["lm_head"]`` — full control:
       ``{"start", "end", "weight"}`` char spans, ``{"text": ..., "weight"}``
       substring occurrences, ``{"regex": ..., "weight"}`` matches, or
-      ``{"token_ids": [...], "weight"}`` token subsequences. Uncovered tokens
-      default to weight 1; overlaps aggregate with **min** (unlearn beats mask
-      beats train).
+      ``{"token_ids": [...], "weight"}`` token subsequences. Overlapping specs
+      aggregate with **min** (unlearn beats mask beats train).
 
-    Passing BOTH raises ``ValueError`` — two competing masking sources would be
-    ambiguous. To combine role masking with span weights, express the roles as
-    spans too (e.g. a ``{"start": 0, "end": len(content), "weight": 0}`` span on
-    each non-assistant message).
+    **Composition (the common case).** ``lm_train_on`` sets each message's
+    BASELINE weight — ``1.0`` for a named role, ``0.0`` for every other role —
+    and explicit specs are then applied ON TOP, OVERRIDING that baseline for
+    the tokens they cover. So the typical chat-SFT recipe is simply::
+
+        lm_train_on="assistant"                     # nothing else is trained
+        + specs on the assistant message only       # e.g. unlearn a bad span
+
+    A spec can also override in the other direction: a
+    ``{"start": 0, "end": 12, "weight": 1.0}`` span on a *user* message trains
+    those tokens despite the role baseline of 0. Only the tokens a spec covers
+    are overridden; the rest of the message keeps its role baseline. Without
+    ``lm_train_on`` the baseline is ``1.0`` everywhere (today's default: no
+    automatic user/system masking at all).
 
     Args:
         conversations: List of conversations.  Each conversation is a
@@ -307,8 +320,11 @@ def build_dataset(
             (``-100``) so only explicitly-marked tokens train; pass ``0`` (or
             any value) to treat unmarked tokens as that class instead.
         lm_train_on: ``"all"`` (default — every token trains the LM head), a
-            role name, or a sequence of role names whose tokens train (all
-            other roles are LM-masked). See above.
+            role name, or a sequence of role names whose tokens train. EVERY
+            other role is LM-masked — ``"assistant"`` masks ``system`` as well
+            as ``user``; pass ``("assistant", "system")`` to keep system too.
+            Sets the per-message baseline that explicit ``lm_head`` specs then
+            override. See above.
 
     Returns:
         List of ``{"tokens": list[int], "labels": ...}`` dicts ready for the
@@ -352,13 +368,6 @@ def build_dataset(
     global_names = sorted(global_probes)
 
     lm_roles = _normalize_lm_train_on(lm_train_on)
-    if lm_roles is not None and any_lm_specs:
-        raise ValueError(
-            f"lm_train_on={lm_train_on!r} AND explicit labels['{LM_HEAD}'] specs were "
-            "both given — two competing sources of LM masking would be ambiguous. "
-            "Either drop lm_train_on (and express the role masking as weight-0 spans "
-            "on the messages to exclude), or remove the explicit specs."
-        )
     emit_lm = lm_roles is not None or any_lm_specs
 
     for conversation in conversations:

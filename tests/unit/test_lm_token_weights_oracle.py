@@ -1,17 +1,21 @@
 """Oracle tests for per-token LM-loss weights (the ``labels["lm_head"]`` channel).
 
-The channel controls how much each token trains the LM head: ``1.0`` = normal,
-``0.0`` = masked, negative = gradient ASCENT (unlearning); ``-100`` = unspecified
-(default ``1.0``). Pinned here, value-level AND behaviorally, on both backends:
+The channel controls how each token trains the LM head: ``w > 0`` = normal
+cross-entropy, ``0.0`` = masked, ``w < 0`` = UNLIKELIHOOD training (Welleck et
+al. 2019, arXiv:1908.04319 -- ``|w| * -log(1-p)``, with ``|w|`` the paper's
+``alpha``); ``-100`` = unspecified (default ``1.0``). Pinned here, value-level
+AND behaviorally, on both backends:
 
-- the weighted CE equals an independent numpy recompute (incl. negative weights);
+- the weighted loss equals an independent numpy recompute (incl. negative weights);
+- negative weights use unlikelihood, NOT negated CE, and the loss is therefore
+  bounded below by 0 -- pinned by a formula oracle and a boundedness test;
 - all-``1.0`` weights reproduce the unweighted ``lm_ce`` exactly;
 - weight ``0.0`` positions contribute nothing (== computing without them);
 - ``-100`` in the channel means "default 1.0", so a sample WITHOUT the channel
   batched next to samples WITH one trains normally (and a plain-list sample's
   probe labels are never broadcast into the channel);
 - **behavioral**: actually training a tiny model INCREASES the probability of a
-  weight ``+1`` token and DECREASES the probability of a weight ``-2`` token —
+  weight ``+1`` token and DECREASES the probability of a negative-weight token —
   the whole point of the feature, not just "no exceptions";
 - the data layer resolves ``lm_train_on`` roles and every explicit span form
   (char span / substring / regex / token-id subsequence) to the right per-token
@@ -61,12 +65,20 @@ class _Cfg:
 def _np_weighted_lm_ce(
     logits: np.ndarray, targets: np.ndarray, mask: np.ndarray, weights: np.ndarray
 ) -> float:
-    """Independent numpy reference: sum(w*ce*m) / max(sum(|w|*m), eps), -100 -> 1."""
+    """Independent numpy reference for the likelihood + unlikelihood objective.
+
+    ``w > 0`` -> ``w * -log p`` (cross-entropy); ``w < 0`` -> ``|w| * -log(1-p)``
+    (unlikelihood, Welleck et al. 2019, with the same 1e-5 floor on ``1-p``);
+    ``-100`` -> the default ``1.0``. Denominator is ``sum(|w| * mask)``.
+    """
     m = logits.max(-1, keepdims=True)
     logp = logits - m - np.log(np.exp(logits - m).sum(-1, keepdims=True))
     ce = -np.take_along_axis(logp, targets[..., None], axis=-1)[..., 0]
     w = np.where(weights == -100.0, 1.0, weights)
-    num = (ce * w * mask).sum()
+    prob = np.exp(-ce)
+    ul = -np.log(np.maximum(1.0 - prob, 1e-5))
+    per_token = np.where(w >= 0.0, w * ce, np.abs(w) * ul)
+    num = (per_token * mask).sum()
     den = max((np.abs(w) * mask).sum(), 1e-8)
     return float(num / den)
 
@@ -448,19 +460,126 @@ def test_overlapping_specs_take_min() -> None:
     assert samples[0]["labels"]["lm_head"] == [0.0, -1.0, -1.0, -1.0]
 
 
-def test_param_plus_specs_conflict_raises() -> None:
-    """lm_train_on= AND explicit lm_head specs together must raise."""
+# --------------------------------------------------------------------------- #
+# COMPOSITION: lm_train_on sets the baseline, explicit specs override it.      #
+# --------------------------------------------------------------------------- #
+
+
+def test_lm_train_on_composes_with_specs_on_the_assistant() -> None:
+    """The 95% case: assistant-only training + an unlearn span on the reply.
+
+    Roles set the baseline (assistant 1.0, everything else 0.0); the span
+    overrides only the tokens it covers.
+    """
+    conv = [
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "ab"},
+            {
+                "role": "assistant",
+                "content": "cdef",
+                "labels": {"lm_head": [{"start": 1, "end": 3, "weight": -1.0}]},
+            },
+        ]
+    ]
+    samples = build_dataset(conv, _CharTok(), lm_train_on="assistant")
+    #        s    y    s    a    b    c     d     e     f
+    assert samples[0]["labels"]["lm_head"] == [
+        0.0,
+        0.0,
+        0.0,  # system: masked by the role baseline
+        0.0,
+        0.0,  # user: masked by the role baseline
+        1.0,
+        -1.0,
+        -1.0,
+        1.0,  # assistant: baseline 1.0, span overrides "de"
+    ]
+
+
+def test_lm_train_on_assistant_masks_system_too() -> None:
+    """The sharp edge, pinned: "assistant" masks SYSTEM as well as user.
+
+    Naming only "assistant" excludes every other role. Callers who want the
+    system prompt trained must name it explicitly (next test).
+    """
+    conv = [
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "ab"},
+            {"role": "assistant", "content": "cd"},
+        ]
+    ]
+    weights = build_dataset(conv, _CharTok(), lm_train_on="assistant")[0]["labels"]["lm_head"]
+    assert weights == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    assert weights[:3] == [0.0, 0.0, 0.0], "system tokens must be masked by lm_train_on='assistant'"
+
+    # Naming system keeps it — the documented escape hatch.
+    both = build_dataset(conv, _CharTok(), lm_train_on=("assistant", "system"))[0]["labels"]
+    assert both["lm_head"] == [1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+
+
+def test_spec_overrides_a_role_masked_message_upward() -> None:
+    """A spec beats the role baseline in BOTH directions.
+
+    A weight-1.0 span on a user message trains those tokens even though
+    lm_train_on='assistant' masked the message — proving the baseline is a
+    default, not a floor, and does not take part in the specs' min rule.
+    """
     conv = [
         [
             {
                 "role": "user",
-                "content": "ab",
-                "labels": {"lm_head": [{"start": 0, "end": 1, "weight": 0.0}]},
+                "content": "abcd",
+                "labels": {"lm_head": [{"start": 0, "end": 2, "weight": 1.0}]},
+            },
+            {"role": "assistant", "content": "ef"},
+        ]
+    ]
+    weights = build_dataset(conv, _CharTok(), lm_train_on="assistant")[0]["labels"]["lm_head"]
+    assert weights == [1.0, 1.0, 0.0, 0.0, 1.0, 1.0], (
+        "a spec must override the role baseline (min() with the baseline would give 0.0)"
+    )
+
+
+def test_composition_specs_still_min_among_themselves() -> None:
+    """Composition does not weaken the min rule BETWEEN overlapping specs."""
+    conv = [
+        [
+            {
+                "role": "assistant",
+                "content": "abcd",
+                "labels": {
+                    "lm_head": [
+                        {"start": 0, "end": 3, "weight": 0.0},
+                        {"start": 1, "end": 4, "weight": -1.0},
+                    ]
+                },
             }
         ]
     ]
-    with pytest.raises(ValueError, match="ambiguous"):
-        build_dataset(conv, _CharTok(), lm_train_on="assistant")
+    weights = build_dataset(conv, _CharTok(), lm_train_on="assistant")[0]["labels"]["lm_head"]
+    assert weights == [0.0, -1.0, -1.0, -1.0]  # unlearn beats mask; uncovered would be 1.0
+
+
+def test_token_ids_spec_composes_with_a_masked_role() -> None:
+    """The token_ids form also overrides the role baseline (not min-ed with it).
+
+    token_ids ranges are applied after the char-span aggregation, so this pins
+    that path separately — it is the one that mutates the weight array in place.
+    """
+    conv = [
+        [
+            {
+                "role": "user",
+                "content": "abcd",
+                "labels": {"lm_head": [{"token_ids": [ord("b"), ord("c")], "weight": 1.0}]},
+            },
+            {"role": "assistant", "content": "ef"},
+        ]
+    ]
+    weights = build_dataset(conv, _CharTok(), lm_train_on="assistant")[0]["labels"]["lm_head"]
+    assert weights == [0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
 
 
 def test_label_field_in_lm_spec_raises() -> None:

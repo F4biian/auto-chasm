@@ -3,7 +3,7 @@
 Helpers used by :func:`auto_chasm.data.build_dataset` to turn role-based
 ``lm_train_on`` settings and explicit per-message weight specs (char spans,
 substrings, regexes, token-id subsequences) into one float weight per token:
-``1.0`` = train, ``0.0`` = mask, negative = unlearn (gradient ascent). See
+``1.0`` = train, ``0.0`` = mask, negative = unlearn (unlikelihood training). See
 ``build_dataset``'s docstring for the user-facing contract and
 ``auto_chasm.trainers._loss_ce.weighted_lm_ce`` for how the loss consumes it.
 """
@@ -54,9 +54,12 @@ def _lm_weights_for_message(
     - ``{"token_ids": [...], "weight": w}`` — every contiguous occurrence of
       that token-id subsequence (resolved on the tokenized message directly).
 
-    Overlaps aggregate with **min** — the most aggressive intervention wins
-    (``-5 < -1 < 0 < 1``: unlearn beats mask beats train). Tokens no spec
-    covers keep ``baseline``.
+    Overlapping SPECS aggregate with **min** — the most aggressive intervention
+    wins (``-5 < -1 < 0 < 1``: unlearn beats mask beats train). ``baseline``
+    (the role baseline from ``lm_train_on``) does NOT take part in that min: it
+    fills only the tokens no spec covers, so a spec always OVERRIDES the role
+    default for the tokens it does cover (including raising a masked user token
+    back to weight 1).
 
     Args:
         msg: The message dict (for ``content`` + spec validation errors).
@@ -123,8 +126,23 @@ def _lm_weights_for_message(
     # Char-form specs -> per-token weights via the shared span aggregator
     # (min = most aggressive wins); uncovered tokens keep the baseline.
     weights = [float(w) for w in _aggregate_span_labels(token_offsets, char_spans, "min", baseline)]
-    # Token-id ranges apply on top, with the same min rule.
+    # Which tokens a char spec actually covered — the SAME overlap test the
+    # aggregator uses. Needed because ``baseline`` must not take part in the
+    # min rule: a spec OVERRIDES the role default, so a weight-1 span on a
+    # role-masked (baseline 0) message has to win, not min to 0.
+    covered = [
+        any(s["start"] < tok_end and s["end"] > tok_start for s in char_spans)
+        for tok_start, tok_end in token_offsets
+    ]
+    # Token-id ranges apply on top: min against another SPEC's weight, but
+    # override an uncovered token's baseline outright.
     for start_idx, end_idx, weight in token_ranges:
         for i in range(start_idx, min(end_idx, len(weights))):
-            weights[i] = min(weights[i], weight)
-    return weights
+            weights[i] = min(weights[i], weight) if covered[i] else weight
+            covered[i] = True
+    # Fit to the token count (mirrors the probe path): the offset mapping and
+    # ``msg_tokens`` come from the same encoding on the transformers path, but
+    # the offset-less fallback can disagree — never let the LM channel drift
+    # out of alignment with the tokens it weights.
+    weights += [baseline] * (len(msg_tokens) - len(weights))
+    return weights[: len(msg_tokens)]

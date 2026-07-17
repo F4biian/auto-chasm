@@ -203,7 +203,10 @@ class Dataset:
                 answers). Length must equal the number of built samples.
             lm_train_on: ``"all"`` (default — every token trains the LM head),
                 or the role(s) whose tokens train it — e.g. ``"assistant"`` for
-                the chat-SFT convention (all other roles are LM-masked). See
+                the chat-SFT convention. EVERY other role is LM-masked
+                (``system`` as well as ``user``); pass ``("assistant",
+                "system")`` to keep system. Composes with explicit ``lm_head``
+                specs, which override this baseline where they apply. See
                 ``build_dataset`` for the full per-token LM-weight channel
                 (masking / unlearning), incl. the explicit-span alternative.
 

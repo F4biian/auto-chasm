@@ -234,37 +234,58 @@ def _class_weight_vector(weights: Sequence[float], ref: Any) -> Any:
     return mx.array(list(weights)).astype(mx.float32)
 
 
+# Floor on ``1 - p`` inside the unlikelihood term, matching the reference
+# implementation of Welleck et al. 2019 (arXiv:1908.04319). Caps a single
+# token's unlikelihood loss at -log(1e-5) ~= 11.5 instead of letting it run to
+# infinity for a token the model currently assigns probability ~1.
+_UL_EPS = 1e-5
+
+
 def weighted_lm_ce(
     lm_logits: Any,
     targets: Any,
     mask: Any,
     token_weights: Any,
 ) -> Any:
-    """Per-token-weighted language-model cross-entropy (both backends).
+    """Per-token-weighted language-model loss: likelihood + unlikelihood.
 
-    Each target token's CE is scaled by its weight from the data's reserved
-    ``labels["lm_head"]`` channel:
+    Each target token's contribution is selected and scaled by its weight from
+    the data's reserved ``labels["lm_head"]`` channel:
 
-    - ``1.0`` — normal training (the default),
-    - ``0.0`` — masked: the token contributes nothing (like ``-100`` labels),
-    - negative (e.g. ``-1.0``) — **gradient ascent** on that token: training
-      actively DECREASES its likelihood ("unlearning" / negated CE, as used in
-      the machine-unlearning literature). Magnitude scales the push.
+    - ``w > 0`` (``1.0`` is the default) — normal training: ``w * -log p``,
+      the usual cross-entropy, pushing the token's probability UP.
+    - ``0.0`` — masked: the token contributes nothing (like ``-100`` labels).
+    - ``w < 0`` (e.g. ``-1.0``) — **unlikelihood training** (Welleck et al.
+      2019, arXiv:1908.04319): ``|w| * -log(1 - p)``, pushing the token's
+      probability DOWN. ``|w|`` is exactly the paper's ``alpha`` mixing
+      coefficient, so magnitudes other than 1 stay meaningful (``-5.0`` is
+      five times the unlikelihood pressure, not a different objective).
     - ``-100`` (the ignore/padding sentinel) — treated as the DEFAULT ``1.0``:
       it marks "weight not specified" (padding, or a sample without an
       ``lm_head`` channel batched next to samples with one), never "mask".
       Positions outside the valid window are excluded by ``mask`` regardless.
 
-    The result is a true weighted mean: ``sum(w * ce * mask) /
+    The result is a weighted mean: ``sum(per_token * mask) /
     max(sum(|w| * mask), eps)`` — with all-``1.0`` weights this reduces exactly
     to the unweighted ``JointOutputs.lm_ce``. The ``|w|`` denominator measures
     the amount of supervision signal (a masked token contributes none; an
     unlearned token contributes as much as a trained one).
 
-    **Caveat (documented, by design):** negated CE is unbounded below — pushing
-    an already-unlikely token further down keeps "improving" the loss. Keep
-    negative magnitudes small (``-1``), monitor the LM loss on ordinary tokens,
-    and prefer few targeted spans over broad ones.
+    **Why unlikelihood and not negated CE.** Simply negating a token's CE is
+    gradient ascent, which is unbounded below: pushing an already-impossible
+    token further down keeps "improving" the loss forever, so the term
+    eventually dominates and the model collapses. ``-log(1 - p)`` instead
+    decays to 0 as ``p -> 0`` — once the token is unlikely, there is nothing
+    left to gain. Every term here is therefore ``>= 0`` and the total loss is
+    bounded below by 0, like any ordinary loss.
+
+    ``p`` is recovered as ``exp(-ce)`` rather than by gathering from a
+    ``softmax``: they are mathematically identical (``ce`` is already
+    ``-log_softmax`` at the target), but this avoids materializing a
+    ``[B, T, V]`` probability tensor over a ~100k-token vocabulary.
+    ``1 - p`` is floored at :data:`_UL_EPS` exactly as in the paper's
+    reference implementation, capping the loss (and its gradient) for a token
+    the model is already certain of.
 
     Args:
         lm_logits: LM logits ``[B, T, V]`` (already next-token aligned).
@@ -274,7 +295,7 @@ def weighted_lm_ce(
             ``labels["lm_head"][:, 1:]`` channel; ``-100`` = unspecified).
 
     Returns:
-        Scalar weighted-mean CE (fp32 accumulation).
+        Scalar weighted-mean loss (fp32 accumulation), ``>= 0``.
     """
     from auto_chasm import ops
 
@@ -300,7 +321,18 @@ def weighted_lm_ce(
     ones = _to_float32(w_raw * 0.0 + 1.0)  # ones_like, backend-agnostic
     w = ops.where(w_raw == -100.0, ones, w_raw)  # -100 = "unspecified" -> default 1.0
     m = _to_float32(mask)
-    num = ops.sum(_to_float32(ce_each) * w * m)
+    ce = _to_float32(ce_each)
+
+    # Unlikelihood term for the negative-weight positions: -log(1 - p), with
+    # p = exp(-ce) the target token's own probability. Both branches are
+    # evaluated (ops.where selects afterwards), so both must stay finite for
+    # every input or the unselected branch would poison the gradient -- the
+    # _UL_EPS floor is what guarantees that here.
+    p = ops.exp(-ce)
+    ul = -ops.log(ops.clamp(ones - p, lo=_UL_EPS))
+
+    per_token = ops.where(w >= 0.0, w * ce, ops.abs(w) * ul)
+    num = ops.sum(per_token * m)
     denom = ops.clamp(ops.sum(ops.abs(w) * m), lo=1e-8)
     return num / denom
 

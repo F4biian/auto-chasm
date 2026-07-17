@@ -216,34 +216,44 @@ automatically (used by [`LayerSweep`](#lora-checkpoints--layer-sweeps)).
 
 ### Per-token LM-loss weights — mask & unlearn tokens
 
-The reserved label key **`"lm_head"`** controls how much each token trains the
-**language-model head** (probe labels are untouched): weight `1.0` = normal
-training, `0.0` = masked (not trained, like `-100`), **negative = actively
-DECREASE the token's likelihood** (gradient ascent on the CE — "unlearning";
-`-1.0` is a standard push, `-5.0` a stronger one). Two mutually exclusive ways
-to declare it:
+The reserved label key **`"lm_head"`** controls how each token trains the
+**language-model head** (probe labels are untouched):
+
+| weight | objective at that token | effect |
+|---|---|---|
+| `1.0` (default) | `-log p` (cross-entropy) | train normally |
+| `w > 0` | `w · -log p` | train, scaled |
+| `0.0` | — | masked, exactly like a `-100` label |
+| `w < 0` | `\|w\| · -log(1 - p)` | **unlikelihood training** — push the token DOWN |
+
+Negative weights run [unlikelihood training (Welleck et al.,
+2019)](https://arxiv.org/abs/1908.04319) on that token, not naive gradient
+ascent: `-log(1-p)` decays to 0 once the token is unlikely, so the term cannot
+run away and the total loss stays bounded below by 0 like any ordinary loss.
+`|w|` is precisely the paper's `alpha` mixing coefficient, so `-5.0` means five
+times the unlikelihood pressure of `-1.0` — the same objective, scaled. Two ways
+to declare it, designed to be used **together**:
 
 ```python
-# 1) Role-based — the chat-SFT switch. Train the LM only on assistant tokens
-#    (user/system tokens get weight 0). Chat/instruct data only — roles must exist.
-data = Dataset.from_conversations(conversations, model.tokenizer,
-                                  lm_train_on="assistant")     # or ("assistant", "system")
-
-# 2) Explicit per-message specs — full control, all forms mixable:
+# 1) Role-based — the chat-SFT switch. Sets each message's BASELINE weight.
+#    "assistant" => assistant tokens 1.0, EVERY other role 0.0 (system too!).
+# 2) Explicit per-message specs — applied ON TOP, overriding that baseline.
 conversations = [[
-    {"role": "user", "content": "Question ..."},                       # no specs: weight 1.0
-    {"role": "assistant", "content": "Answer with a hallucination.",
+    {"role": "system", "content": "You are ..."},                      # baseline 0.0 (masked)
+    {"role": "user", "content": "Question ..."},                       # baseline 0.0 (masked)
+    {"role": "assistant", "content": "Answer with a hallucination.",   # baseline 1.0 (trained)
      "labels": {
          "halluc":  [{"start": 14, "end": 31, "label": 1}],            # a probe, as usual
          "lm_head": [                                                  # the LM-weight channel
              {"start": 14, "end": 31, "weight": -1.0},                 # char span -> unlearn
              {"text": "hallucination", "weight": 0.0},                 # every occurrence -> mask
              {"regex": r"\d{4}", "weight": 0.0},                       # every match
-             {"token_ids": [1234, 567], "weight": -2.0},               # token subsequence
+             {"token_ids": [1234, 567], "weight": -2.0},               # token subsequence, alpha=2
          ],
      }},
 ]]
-data = Dataset.from_conversations(conversations, model.tokenizer)
+data = Dataset.from_conversations(conversations, model.tokenizer,
+                                  lm_train_on="assistant")     # or ("assistant", "system")
 ```
 
 That is the whole API — `Trainer`/`JointLoss` pick the channel up from the data
@@ -251,22 +261,31 @@ automatically (no loss configuration). Semantics worth knowing:
 
 - **Default = today's behavior.** Without `lm_train_on`/specs nothing changes:
   every token trains the LM head (there is NO automatic user-token masking).
-- Overlapping specs aggregate with **min** — the most aggressive intervention
-  wins (`-5 < -1 < 0 < 1`).
-- `lm_train_on=` **and** explicit specs together raise `ValueError` (two
-  competing masking sources would be ambiguous). To combine role masking with
-  span weights, express the roles as spans too — e.g. a
-  `{"start": 0, "end": len(content), "weight": 0}` span on each non-assistant
-  message.
+- ⚠️ **`lm_train_on` masks every role you do not name — `system` included.**
+  `"assistant"` is the standard chat-SFT choice (you almost never want the model
+  learning to *emit* its own system prompt), but if you do want system tokens
+  trained, name them: `lm_train_on=("assistant", "system")`.
+- **The two compose: role = baseline, specs = override.** `lm_train_on` sets
+  each message's baseline (named role → `1.0`, everything else → `0.0`); specs
+  then override the baseline for the tokens they cover, in either direction — a
+  `weight: -1.0` span unlearns part of an assistant reply, and a `weight: 1.0`
+  span on a user message trains it despite the role baseline. Tokens no spec
+  covers keep their role baseline.
+- Overlapping **specs** aggregate with **min** — the most aggressive
+  intervention wins (`-5 < -1 < 0 < 1`). The role baseline does *not* take part
+  in that min, which is what lets a spec override a masked role.
 - With an active channel, `labels` is always a per-probe dict + the float
   `"lm_head"` array; attach probes under the same names your spans use.
 - A custom `losses={"lm_head": fn}` override + the channel raises (the weights
   would be silently ignored otherwise).
-- **Unlearning caveat:** negated CE is unbounded below — an already-unlikely
-  token can be pushed down forever, and too-strong pushes destabilize training.
-  Keep magnitudes small (`-1`), watch the LM loss on ordinary tokens, and
-  prefer targeted spans. (The bounded alternative from the literature,
-  unlikelihood training `-log(1-p)`, is not implemented.)
+- **Unlearning is bounded, but not free.** Every term is `>= 0` and a token
+  already at `p ~ 0` contributes ~nothing, so unlearning cannot run away the
+  way negated CE does. `1 - p` is floored at `1e-5` (as in the paper's
+  reference implementation), which caps one token's loss at `~11.5` and its
+  gradient with it. What unlikelihood does NOT decide for you is what the
+  probability mass moves *to*: suppressing a token redistributes it over the
+  rest of the vocabulary, so still prefer targeted spans over broad ones and
+  watch the LM loss on ordinary tokens.
 
 ---
 
