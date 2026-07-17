@@ -88,7 +88,9 @@ def train_torch(
 
     for global_step, batch in zip(
         range(1, trainer.num_iters + 1),
-        iterate_batches(train_data, trainer.batch_size, trainer.max_seq_length, loop=True),
+        iterate_batches(
+            train_data, trainer.batch_size, trainer.max_seq_length, loop=True, seed=trainer.seed
+        ),
         strict=False,
     ):
         tokens, labels, lengths = batch

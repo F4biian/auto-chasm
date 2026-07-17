@@ -346,3 +346,40 @@ def resolve_early_stopping_metric(metric_name: str, val_metrics: dict[str, Any])
         f"loss-components by default; supply a metrics function that produces "
         f"{key!r}, or use early_stopping_metric='val_loss'."
     )
+
+
+def write_training_manifest(trainer: Any, best_iter: int, best_metric: float) -> Path:
+    """Write ``<output_dir>/training_manifest.json`` for the MLX loop.
+
+    The torch loop builds its manifest via :func:`torch_manifest` and writes it
+    through :func:`finalize_torch_run`; this is the MLX-side counterpart, kept
+    beside it so the two manifest writers stay visible to each other.
+
+    Args:
+        trainer: The ``JointTrainer`` whose config is recorded.
+        best_iter: Iteration of the best checkpoint (0 if none).
+        best_metric: Metric value at ``best_iter``.
+
+    Returns:
+        The path written.
+    """
+    # JSON does not support Infinity/NaN — use None for unset metrics
+    metric_for_json: float | None = None
+    if best_iter > 0 and math.isfinite(best_metric):
+        metric_for_json = best_metric
+
+    manifest = {
+        "base_model": getattr(trainer.wrapper, "_base_model_name", None),
+        "backend": trainer.wrapper.backend.name,
+        "best_iter": best_iter,
+        "best_metric": metric_for_json,
+        "best_metric_name": trainer.early_stopping_metric,
+        "num_iters": trainer.num_iters,
+        "early_stopping_patience": trainer.early_stopping_patience,
+        "min_delta": trainer.min_delta,
+        "keep_best_only": trainer.keep_best_only,
+    }
+    path = Path(trainer.output_dir) / "training_manifest.json"
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    return path

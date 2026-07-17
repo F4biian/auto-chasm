@@ -76,6 +76,12 @@ class Trainer:
         custom_train_fn: If set, replaces the default training loop entirely.
             Called as ``custom_train_fn(model, trainer)``.
         verbose: Whether to print training progress to stdout.
+        seed: Seeds the training batch ORDER (``iterate_batches`` shuffles with
+            ``np.random.default_rng(seed)``, which draws OS entropy when this is
+            ``None`` and deliberately ignores the global numpy seed — so batch
+            order is reproducible only if you pass this). ``None`` (default)
+            keeps the previous unseeded behavior. Seed the frameworks yourself
+            for weight init.
         eval_metrics_fn: Optional callable ``(train_model, captured, targets,
             mask) -> dict[str, float]`` producing custom validation metrics
             (e.g. F1, accuracy), enabling non-loss ``early_stopping_metric``
@@ -113,6 +119,7 @@ class Trainer:
         lr_schedule: str = _UNSET,
         warmup_ratio: float = _UNSET,
         eval_metrics_fn: Callable[..., dict[str, float]] | None = None,
+        seed: int | None = None,
         config: TrainingConfig | None = None,
     ) -> None:
         """Initialize the trainer.
@@ -135,6 +142,7 @@ class Trainer:
         self.model = model
         self.loss_fn = loss_fn
         self.eval_metrics_fn = eval_metrics_fn
+        self.seed = seed
         self.num_iters = num_iters
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
@@ -249,7 +257,9 @@ class Trainer:
             return self._get_joint().iterate(train_data)  # type: ignore[no-any-return]
         from auto_chasm.trainers.data_utils import iterate_batches
 
-        return iterate_batches(train_data, self.batch_size, self.max_seq_length, loop=True)
+        return iterate_batches(
+            train_data, self.batch_size, self.max_seq_length, loop=True, seed=self.seed
+        )
 
     def step(self, batch: tuple[Any, Any, Any]) -> dict[str, float]:
         """Run one training step (works on both backends).
@@ -403,6 +413,7 @@ class Trainer:
         from auto_chasm.trainers.base import JointTrainer
 
         joint = JointTrainer(
+            seed=self.seed,
             model=self.model,
             loss_fn=self.loss_fn,
             learning_rate=self.learning_rate,

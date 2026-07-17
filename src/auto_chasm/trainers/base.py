@@ -20,8 +20,6 @@ step-level escape-hatch API::
 
 from __future__ import annotations
 
-import json
-import math
 import time
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -124,6 +122,7 @@ class JointTrainer:
         lr_schedule: str = _UNSET,
         warmup_ratio: float = _UNSET,
         eval_metrics_fn: Callable[..., dict[str, float]] | None = None,
+        seed: int | None = None,
         mixed_precision: str = _UNSET,
         config: TrainingConfig | None = None,
     ) -> None:
@@ -140,6 +139,7 @@ class JointTrainer:
         self.wrapper = model
         self.loss_fn = loss_fn
         self.eval_metrics_fn = eval_metrics_fn
+        self.seed = seed
         self.num_iters = num_iters
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
@@ -325,11 +325,10 @@ class JointTrainer:
                 f"metric={self.early_stopping_metric}, min_delta={self.min_delta}"
             )
 
-        for it, batch in zip(
-            range(1, self.num_iters + 1),
-            iterate_batches(train_data, self.batch_size, self.max_seq_length, loop=True),
-            strict=False,
-        ):
+        batches = iterate_batches(
+            train_data, self.batch_size, self.max_seq_length, loop=True, seed=self.seed
+        )
+        for it, batch in zip(range(1, self.num_iters + 1), batches, strict=False):
             tic = time.perf_counter()
 
             # Take the optimizer step FIRST, then evaluate — so an eval (and any best
@@ -544,7 +543,9 @@ class JointTrainer:
         """
         from auto_chasm.trainers.data_utils import iterate_batches
 
-        return iterate_batches(train_data, self.batch_size, self.max_seq_length, loop=True)
+        return iterate_batches(
+            train_data, self.batch_size, self.max_seq_length, loop=True, seed=self.seed
+        )
 
     def step(self, batch: tuple[Any, Any, Any]) -> dict[str, Any]:
         """Run one training step (forward + backward + optimizer update).
@@ -713,25 +714,9 @@ class JointTrainer:
 
     def _save_training_manifest(self, best_iter: int, best_metric: float) -> None:
         """Write a training manifest with best-checkpoint metadata."""
-        # JSON does not support Infinity/NaN — use None for unset metrics
-        metric_for_json: float | None = None
-        if best_iter > 0 and math.isfinite(best_metric):
-            metric_for_json = best_metric
+        from auto_chasm.trainers._metrics import write_training_manifest
 
-        manifest = {
-            "base_model": getattr(self.wrapper, "_base_model_name", None),
-            "backend": self.wrapper.backend.name,
-            "best_iter": best_iter,
-            "best_metric": metric_for_json,
-            "best_metric_name": self.early_stopping_metric,
-            "num_iters": self.num_iters,
-            "early_stopping_patience": self.early_stopping_patience,
-            "min_delta": self.min_delta,
-            "keep_best_only": self.keep_best_only,
-        }
-        path = self.output_dir / "training_manifest.json"
-        with open(path, "w") as f:
-            json.dump(manifest, f, indent=2)
+        path = write_training_manifest(self, best_iter, best_metric)
         self._log(f"  Training manifest saved to {path}")
 
     def _cleanup_periodic_checkpoints(self) -> None:
