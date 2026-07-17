@@ -334,11 +334,16 @@ def evaluate_joint_model(  # pragma: no cover — tested via integration
     total_components: dict[str, Any] = {}
     total_ntoks = mx.array(0.0)
     metric_accum: dict[str, float] = {}
+    # PER-KEY weight sums: a metric fn may legitimately omit a key for some
+    # batches (e.g. AUROC is undefined for a single-class batch). Each key must
+    # be averaged over the weight of the batches where it was PRESENT — dividing
+    # by the total weight (the old single-scalar denominator) silently deflated
+    # any sometimes-missing metric by the weight fraction of the batches that
+    # omitted it.
+    metric_weights: dict[str, float] = {}
 
     if len(dataset) == 0:
         return {"loss": float("inf"), "perplexity": float("inf"), "ntokens": 0}
-
-    metric_weight = 0.0  # sum of per-batch valid-token counts (metric denominator)
     for i, batch in enumerate(iterate_batches(dataset, batch_size, max_seq_length, loop=False)):
         if num_batches >= 0 and i >= num_batches:
             break
@@ -380,20 +385,19 @@ def evaluate_joint_model(  # pragma: no cover — tested via integration
             # batch). Exact for accuracy/precision/recall/mse/mae; macro-F1 becomes a
             # token-weighted mean (an approximation of corpus F1 across eval batches).
             w = float(m.sum())
-            metric_weight += w
             for k, v in batch_metrics.items():
                 metric_accum[k] = metric_accum.get(k, 0.0) + float(v) * w
+                metric_weights[k] = metric_weights.get(k, 0.0) + w
 
         eval_args = [total_loss, total_ntoks]
         eval_args.extend(total_components.values())
         mx.eval(*eval_args)
 
-    # Divide by the total valid-token weight (token-weighted mean, not per-batch mean).
-    if eval_metrics_fn is not None and metric_weight > 0:
-        for k in metric_accum:
-            metric_accum[k] /= metric_weight
-    elif eval_metrics_fn is None:
-        metric_accum = {}
+    # Divide each key by ITS OWN summed weight (token-weighted mean over the
+    # batches where the key was present — see the metric_weights note above).
+    for k in metric_accum:
+        if metric_weights.get(k, 0.0) > 0:
+            metric_accum[k] /= metric_weights[k]
 
     ntoks_val = float(total_ntoks)
     avg_loss = (total_loss / total_ntoks).item() if ntoks_val > 0 else float("inf")

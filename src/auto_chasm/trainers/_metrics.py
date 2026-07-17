@@ -250,7 +250,11 @@ def evaluate_torch_model(
     total_components: dict[str, float] = {}
     total_ntoks = 0.0
     metric_accum: dict[str, float] = {}
-    metric_weight = 0.0  # sum of per-batch valid-token counts (metric denominator)
+    # PER-KEY weight sums (mirrors the MLX evaluate_joint_model): a metric fn may
+    # omit a key for some batches (e.g. AUROC on a single-class batch), and each
+    # key must be averaged over the weight where it was PRESENT — a single shared
+    # denominator silently deflated any sometimes-missing metric.
+    metric_weights: dict[str, float] = {}
 
     with torch.no_grad():
         for batch in iterate_batches(dataset, batch_size, max_seq_length, loop=False):
@@ -297,9 +301,9 @@ def evaluate_torch_model(
                     # per-batch mean (see the MLX evaluate_joint_model for the note on
                     # macro-F1 becoming a token-weighted mean across eval batches).
                     w = float(m.sum().item())
-                    metric_weight += w
                     for k, v in batch_metrics.items():
                         metric_accum[k] = metric_accum.get(k, 0.0) + float(v) * w
+                        metric_weights[k] = metric_weights.get(k, 0.0) + w
 
     result: dict[str, float] = {
         "loss": total_loss / total_ntoks if total_ntoks > 0 else float("inf")
@@ -307,7 +311,9 @@ def evaluate_torch_model(
     for key, acc in total_components.items():
         result[key] = acc / total_ntoks if total_ntoks > 0 else 0.0
     for key, acc in metric_accum.items():
-        result[key] = acc / metric_weight if metric_weight > 0 else 0.0
+        # Per-key denominator: average over the batches where THIS key was present.
+        key_weight = metric_weights.get(key, 0.0)
+        result[key] = acc / key_weight if key_weight > 0 else 0.0
     return result
 
 
