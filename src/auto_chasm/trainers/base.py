@@ -200,9 +200,18 @@ class JointTrainer:
             )
 
         self._base_lr = learning_rate
-        warmup_steps = int(num_iters * warmup_ratio)
+        # The schedule's horizon must be counted in OPTIMIZER UPDATES, not
+        # micro-iterations: mlx.optimizers advances a schedule once per
+        # optimizer.update() call, which fires only on gradient-accumulation
+        # boundaries (plus the final partial flush). Sizing it by num_iters
+        # stretched the schedule by grad_accum_steps — with 500 iters and
+        # accum 8, warmup (10%) covered 50 of the 63 real updates (~80% of
+        # training) and the cosine tail never ran. The torch loop already
+        # counts updates (see _torch_loop); this makes MLX match it.
+        n_updates = num_iters // grad_accum_steps + (1 if num_iters % grad_accum_steps else 0)
+        warmup_steps = int(n_updates * warmup_ratio)
         self.lr_schedule = self._build_lr_schedule(
-            lr_schedule, learning_rate, num_iters, warmup_steps
+            lr_schedule, learning_rate, n_updates, warmup_steps
         )
         self.optimizer = optim.AdamW(
             learning_rate=self.lr_schedule,
@@ -442,10 +451,16 @@ class JointTrainer:
                 train_loss = losses.item() / steps
                 avg_components = {k: v.item() / steps for k, v in component_accum.items()}
                 if callable(self.lr_schedule):
-                    # The step counter starts at 0, so iteration ``it`` used
-                    # ``schedule(it - 1)``; record that actually-applied LR (logging
-                    # ``schedule(it)`` shifts the curve and logs LR=0 on the last step).
-                    raw_lr = self.lr_schedule(it - 1)
+                    # The schedule advances once per OPTIMIZER UPDATE (its
+                    # horizon is n_updates, not num_iters), so index it by the
+                    # number of updates completed by iteration ``it`` — indexing
+                    # by micro-iteration would read the curve 8x too far in and
+                    # log a fictitious LR. max(..., 0) covers logging before the
+                    # first accumulation boundary.
+                    updates_done = it // self.grad_accum_steps + (
+                        1 if it == self.num_iters and it % self.grad_accum_steps else 0
+                    )
+                    raw_lr = self.lr_schedule(max(updates_done - 1, 0))
                     lr = raw_lr.item() if hasattr(raw_lr, "item") else float(raw_lr)
                 else:
                     lr = self._base_lr

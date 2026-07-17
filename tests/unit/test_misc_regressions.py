@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -83,3 +85,56 @@ def test_m18_single_token_batch_has_empty_components() -> None:
     assert math.isfinite(float(total))
     assert components == {}  # nothing to supervise -> no terms (was {"lm_head": 0})
     assert float(ntoks) == 0.0
+
+
+def test_mlx_lr_schedule_horizon_counts_optimizer_updates() -> None:
+    """The MLX schedule's horizon is optimizer UPDATES, not micro-iterations.
+
+    mlx.optimizers advances a schedule once per optimizer.update(), which fires
+    only on gradient-accumulation boundaries. Sizing the schedule by num_iters
+    stretched it by grad_accum_steps: with 500 iters / accum 8 (63 real
+    updates), warmup (10%) covered 50 of the 63 updates (~80% of training) and
+    the cosine tail never ran. Pinned: by the LAST update the cosine must have
+    decayed to near-zero, and warmup must end within the first ~10% of updates.
+    """
+    import mlx.nn as nn
+
+    from auto_chasm import Model
+    from auto_chasm.trainers.base import JointTrainer
+
+    class _Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = nn.Embedding(8, 4)
+            self.output_proj = nn.Linear(4, 8)
+
+        def __call__(self, x):  # type: ignore[no-untyped-def]
+            return self.output_proj(self.embedding(x))
+
+    class _Cfg:
+        hidden_size = 4
+        num_hidden_layers = 1
+
+    m = Model(_Tiny(), None, "mlx")
+    m.model.config = _Cfg()
+    from auto_chasm import JointLoss
+
+    trainer = JointTrainer(
+        model=m,
+        loss_fn=JointLoss(),
+        num_iters=500,
+        grad_accum_steps=8,
+        lr_schedule="cosine",
+        warmup_ratio=0.1,
+        learning_rate=2e-4,
+    )
+    n_updates = 500 // 8 + 1  # 62 full accumulation groups + the final partial flush
+    peak = max(float(trainer.lr_schedule(i)) for i in range(n_updates))
+    last = float(trainer.lr_schedule(n_updates - 1))
+    mid = float(trainer.lr_schedule(n_updates // 2))
+    assert peak == pytest.approx(2e-4, rel=0.05), "peak LR should reach the configured LR"
+    assert last < 0.05 * peak, (
+        f"LR at the final update is {last:.2e} ({last / peak:.0%} of peak) — the cosine "
+        "tail never ran; the schedule horizon is being counted in micro-iterations."
+    )
+    assert mid < peak, "mid-training LR should already be decaying (not still warming up)"
