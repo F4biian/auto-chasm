@@ -663,33 +663,17 @@ class Model:
 
         return _compute(self, self._probes, dataset, self.backend.name, batch_size, max_seq_length)
 
-    def save_class_means(
-        self,
-        class_means: dict[str, dict[str, Any]],
-        path: str,
-    ) -> None:
-        """Save class-mean vectors to one file (``.safetensors``/``.pth``).
+    def save_class_means(self, class_means: dict[str, dict[str, Any]], path: str) -> None:
+        """Save class-mean vectors (see ``auto_chasm.class_means.save_class_means``)."""
+        from auto_chasm.class_means import save_class_means
 
-        Args:
-            class_means: ``{probe_name: {"mean_0": tensor, "mean_1": tensor}}``.
-            path: File path (``.safetensors`` for MLX, ``.pth`` for PyTorch).
-        """
-        from pathlib import Path
-
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.backend.wrapping.save_class_means(class_means, path)
-        logger.info("Class means saved to %s", path)
+        save_class_means(self, class_means, path)
 
     def load_class_means(self, path: str) -> dict[str, Any]:
-        """Load class-mean vectors from a file (backend-agnostic, auto-format).
+        """Load class-mean vectors (see ``auto_chasm.class_means.load_class_means``)."""
+        from auto_chasm.class_means import load_class_means
 
-        Args:
-            path: File path (auto-detected format).
-
-        Returns:
-            Dict with ``"mean_0"`` / ``"mean_1"`` tensors.
-        """
-        return self.backend.wrapping.load_class_means(path)
+        return load_class_means(self, path)
 
     def restore_original_layers(self) -> None:
         """Remove all capture wrappers, returning the model to its original state.

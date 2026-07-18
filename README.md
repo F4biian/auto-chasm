@@ -650,7 +650,17 @@ model.prepare_for_joint_training()   # LM loss now trains the LoRA adapters, the
 ```
 
 `LoraConfig(peft_method=...)` selects `"lora"` (default), `"qlora"` (quantized), or
-`"dora"`; `target_modules=None` auto-detects the attention projections.
+`"dora"`. `target_modules=None` adapts **every adaptable linear module** — all
+attention *and* MLP projections of every layer; only the LM head is excluded
+(the "all-linear" convention: with tied embeddings, adapting the head would
+double-adapt the input embedding). Pass an explicit list to narrow the scope.
+The exact set a model exposes:
+
+```python
+model.lora_targetable_modules   # ["model.layers.0.self_attn.q_proj", ...] — the
+                                # default target set, stable before/after adapters
+model.stats()                   # includes it under "lora_targetable_modules"
+```
 
 **Checkpoints.** `save_checkpoint` writes one folder with the probe weights, any
 adapters, the steering geometry, and the config; `from_checkpoint` restores all of it:

@@ -181,3 +181,34 @@ def _compute_torch(
         count_1 += m1.sum().item()
 
     return sum_0 / max(count_0, 1), sum_1 / max(count_1, 1)
+
+
+def save_class_means(model: Any, class_means: dict[str, dict[str, Any]], path: str) -> None:
+    """Save class-mean vectors to one file (``.safetensors``/``.pth``).
+
+    Lives here rather than inline on ``Model`` so all class-mean logic —
+    computing the means and persisting them — sits in one module.
+
+    Args:
+        model: The ``Model`` whose backend performs the write.
+        class_means: ``{probe_name: {"mean_0": tensor, "mean_1": tensor}}``.
+        path: File path (``.safetensors`` for MLX, ``.pth`` for PyTorch).
+    """
+    from pathlib import Path
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    model.backend.wrapping.save_class_means(class_means, path)
+    logger.info("Class means saved to %s", path)
+
+
+def load_class_means(model: Any, path: str) -> dict[str, Any]:
+    """Load class-mean vectors from a file (backend-agnostic, auto-format).
+
+    Args:
+        model: The ``Model`` whose backend performs the read.
+        path: File path (auto-detected format).
+
+    Returns:
+        Dict with ``"mean_0"`` / ``"mean_1"`` tensors.
+    """
+    return model.backend.wrapping.load_class_means(path)  # type: ignore[no-any-return]
