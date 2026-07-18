@@ -743,6 +743,17 @@ class Model:
 
         return num_parameters(self, trainable=trainable)
 
+    @property
+    def lora_targetable_modules(self) -> list[str]:
+        """Every module LoRA can adapt — full paths (see ``peft.targetable_lora_modules``).
+
+        This is exactly the set ``LoraConfig(target_modules=None)`` adapts by
+        default. Also included in :meth:`stats`.
+        """
+        from auto_chasm.peft import targetable_lora_modules
+
+        return targetable_lora_modules(self.model)
+
     def stats(self) -> dict[str, Any]:
         """Architecture + parameter stats as a dict (see ``auto_chasm._model_stats``)."""
         from auto_chasm._model_stats import model_stats

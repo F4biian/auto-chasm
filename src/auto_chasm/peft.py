@@ -105,11 +105,72 @@ def _filter_lora_targets(
     return result
 
 
-def _default_target_modules(model: Any) -> list[str]:
-    """Infer default LoRA target module keys from model architecture.
+# Linear-like leaf module class names LoRA can wrap, framework-agnostic:
+# torch nn.Linear / GPT-2-style Conv1D, MLX nn.Linear / nn.QuantizedLinear.
+_LINEAR_CLASS_NAMES = ("Linear", "QuantizedLinear", "Conv1D")
 
-    Scans the model's named modules for attention projection layers
-    and returns full dotted paths (e.g., ``"self_attn.q_proj"``).
+
+def targetable_lora_modules(model: Any) -> list[str]:
+    """Every module LoRA can adapt in ``model`` — full dotted paths, in model order.
+
+    "Targetable" means a linear-like LEAF module (``Linear``/``QuantizedLinear``/
+    ``Conv1D``), excluding:
+
+    - the LM head (any path whose last component is ``lm_head``) — adapting the
+      output embedding is excluded by convention (mirrors PEFT's
+      ``target_modules="all-linear"``), and a tied head would double-adapt the
+      input embedding;
+    - modules that are already LoRA internals (path contains ``lora``), so
+      listing an adapted model describes the BASE architecture, not the
+      adapters.
+
+    This is also the DEFAULT target set when ``LoraConfig.target_modules`` is
+    ``None`` — i.e. by default LoRA adapts everything it can. Exposed as
+    ``Model.lora_targetable_modules`` and in ``Model.stats()``.
+
+    Args:
+        model: The (raw) language model.
+
+    Returns:
+        List of full module paths, order-stable, possibly empty for a model
+        that exposes no ``named_modules``.
+    """
+    targets: list[str] = []
+    adapter_prefixes: list[str] = []
+    try:
+        for name, mod in model.named_modules():
+            if not name:
+                continue
+            cls = type(mod).__name__.lower()
+            # An adapter wrapper (LoRALinear/DoRALinear/peft LoraLayer...) IS the
+            # canonical linear position — report it once and skip its internals
+            # (its inner base .linear and its lora_A/lora_B would otherwise be
+            # listed as three bogus extra targets).
+            if "lora" in cls or "dora" in cls:
+                adapter_prefixes.append(name + ".")
+                if name.rsplit(".", 1)[-1] != "lm_head":
+                    targets.append(name)
+                continue
+            if any(name.startswith(pre) for pre in adapter_prefixes):
+                continue
+            if type(mod).__name__ not in _LINEAR_CLASS_NAMES:
+                continue
+            last = name.rsplit(".", 1)[-1]
+            if last == "lm_head" or "lora" in name.lower():
+                continue
+            targets.append(name)
+    except Exception:
+        pass
+    return targets
+
+
+def _default_target_modules(model: Any) -> list[str]:
+    """The default LoRA target set: EVERY adaptable linear module.
+
+    ``target_modules=None`` means "adapt everything you can" — all linear-like
+    leaf modules except the LM head (see :func:`targetable_lora_modules`), not
+    merely the attention q/k/v projections. Callers who want a narrower scope
+    pass it explicitly.
 
     Args:
         model: The language model.
@@ -117,20 +178,10 @@ def _default_target_modules(model: Any) -> list[str]:
     Returns:
         List of module name keys to target.
     """
-    targets: list[str] = []
-    target_suffixes = ("q_proj", "k_proj", "v_proj")
-
-    try:
-        for name, _mod in model.named_modules():
-            if any(name.endswith(s) for s in target_suffixes):
-                targets.append(name)
-    except Exception:
-        pass
-
+    targets = targetable_lora_modules(model)
     if not targets:
         targets = list(DEFAULT_LORA_KEYS)
         logger.warning("Could not infer target modules; using defaults: %s", targets)
-
     return targets
 
 

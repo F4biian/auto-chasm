@@ -136,16 +136,18 @@ class TestPEFTUnfreeze:
         base.freeze()
         _unfreeze_lora_params(base, Backend(force="mlx"))
 
-    def test_target_modules_fallback(self) -> None:
-        import pytest
-
-        from auto_chasm.peft import apply_lora
+    def test_default_targets_adapt_every_linear(self) -> None:
+        from auto_chasm.peft import apply_lora, targetable_lora_modules
 
         base = TinyMlp()
-        # No attention-projection modules to target — now a clear error rather
-        # than a silent no-op.
-        with pytest.raises(ValueError):
-            apply_lora(base, r=4, alpha=8)
+        # Default targeting is ALL-LINEAR: a model with no attention projections
+        # is still fully adaptable (previously this raised because the default
+        # only matched q/k/v). The targetable listing must be non-empty and the
+        # default apply must adapt exactly that set.
+        targets = targetable_lora_modules(base)
+        assert targets, "TinyMlp's Linear layers must be targetable"
+        adapted = apply_lora(base, r=4, alpha=8)
+        assert adapted is not None
 
 
 # ===========================================================================

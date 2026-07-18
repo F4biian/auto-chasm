@@ -72,10 +72,13 @@ def model_stats(model: Any) -> dict[str, Any]:
     Keys: ``backend``, ``num_layers``, ``hidden_size``, ``vocab_size``,
     ``num_attention_heads``, ``intermediate_size`` (the MLP width; ``None`` when the
     config does not expose it), ``num_parameters``, ``num_trainable_parameters``,
-    ``num_probes``, and ``probe_parameters`` (a ``{probe_name: count}`` map).
+    ``num_probes``, ``probe_parameters`` (a ``{probe_name: count}`` map), and
+    ``lora_targetable_modules`` (every module path LoRA can adapt — the default
+    target set when ``LoraConfig.target_modules`` is ``None``).
     """
     base = model.model
     return {
+        "lora_targetable_modules": model.lora_targetable_modules,
         "backend": model.backend.name,
         "num_layers": model.num_layers,
         "hidden_size": hidden_size(base),
