@@ -13,6 +13,31 @@ from auto_chasm.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _load_tensor_file(path: str) -> dict[str, Any]:
+    """Load a tensor state dict, accepting safetensors or a legacy torch pickle.
+
+    ``save_adapters`` writes safetensors. Checkpoints produced before that fix hold
+    a ``torch.save`` pickle under the same ``.safetensors`` name, and ``torch.load``
+    dispatches on the extension, so it cannot read them either -- hence the explicit
+    pickle fallback rather than relying on torch.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        Mapping of parameter name to tensor.
+    """
+    try:
+        from safetensors.torch import load_file
+
+        return dict(load_file(path, device="cpu"))
+    except Exception:
+        import torch
+
+        with open(path, "rb") as fh:
+            return dict(torch.load(fh, map_location="cpu", weights_only=True))
+
+
 class TorchTensorOps:
     """Tensor creation and manipulation for PyTorch."""
 
@@ -308,7 +333,7 @@ class TorchModelWrapping:
             model: The PEFT model.
             path: File path to save to.
         """
-        import torch
+        from safetensors.torch import save_file
 
         state = {k: v.cpu() for k, v in model.state_dict().items() if "lora_" in k}
         if not state:
@@ -319,7 +344,17 @@ class TorchModelWrapping:
                 "Was apply_lora()/attach_lora() called?"
             )
             return
-        torch.save(state, path)
+        # WRITE REAL SAFETENSORS. The checkpoint calls this file
+        # ``adapters.safetensors`` (and the MLX backend writes genuine safetensors
+        # into it), but this backend used ``torch.save``, i.e. a pickle wearing a
+        # .safetensors name. torch >= 2.6 dispatches ``torch.load`` on that
+        # extension to safetensors, so the pickle could no longer be read back at
+        # all: both the tensor count at save time and ``load_adapters`` died with
+        # "Error while deserializing header: header too large".
+        # detach().contiguous().clone() because safetensors rejects tensors that
+        # are non-contiguous or share storage; adapters are small, so the copy is
+        # cheap.
+        save_file({k: v.detach().contiguous().clone() for k, v in state.items()}, path)
 
     def load_adapters(self, model: Any, path: str) -> Any:
         """Load adapter weights from a single file.
@@ -334,9 +369,7 @@ class TorchModelWrapping:
         Returns:
             Model with loaded adapter weights.
         """
-        import torch
-
-        state = torch.load(path, map_location="cpu")
+        state = _load_tensor_file(path)
         model.load_state_dict(state, strict=False)
         return model
 

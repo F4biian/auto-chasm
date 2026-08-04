@@ -235,9 +235,20 @@ def _count_tensor_file(path: Path) -> int:
         with safe_open(str(path), framework=safetensors_framework()) as f:
             return len(f.keys())  # noqa: SIM118  # safe_open is not a dict
     except Exception:
+        pass
+    # This count only decides whether to emit a warning, so it must NEVER be the
+    # thing that kills a run. The old fallback called torch.load on a path ending
+    # in .safetensors, which torch >= 2.6 routes straight back to safetensors --
+    # so a file safe_open could not read raised again here, uncaught, and took a
+    # finished training job down at checkpoint time.
+    try:
         import torch
 
-        return len(torch.load(str(path), map_location="cpu", weights_only=False))
+        with open(path, "rb") as fh:
+            return len(torch.load(fh, map_location="cpu", weights_only=True))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not count tensors in %s (%s); assuming 0.", path, exc)
+        return 0
 
 
 def _warn_unpersisted_base(model: Model, n_saved_adapter_tensors: int) -> None:
