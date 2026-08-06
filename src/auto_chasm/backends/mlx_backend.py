@@ -18,6 +18,38 @@ from auto_chasm.logger import get_logger
 
 logger = get_logger(__name__)
 
+#: Default ceiling for MLX's buffer cache, in bytes. MLX retains freed buffers of
+#: every distinct shape it has seen so it can reuse them; with variable-length
+#: sequences that set keeps growing, and NOTHING in this library ever released it.
+#: A real consequence: a 0.5B-parameter MLX run drove a 64 GB Mac to 0.4 GB free
+#: and had to be killed, while `ps` RSS reported 2.7 GB -- Metal's unified memory
+#: is invisible to RSS, so neither the process nor any RSS-based watchdog can see
+#: it coming. Capping the cache bounds the growth; measured peak with a 1 GiB cap
+#: was ~5 GB for that same run.
+#:
+#: Override with AUTO_CHASM_MLX_CACHE_LIMIT_GB (0 disables the cap entirely).
+_DEFAULT_CACHE_LIMIT_GB = 4.0
+
+
+def configure_mlx_memory() -> None:
+    """Bound MLX's buffer cache. Idempotent; safe to call more than once.
+
+    Reads AUTO_CHASM_MLX_CACHE_LIMIT_GB (float GiB; ``0`` = no cap) and
+    AUTO_CHASM_MLX_MEMORY_LIMIT_GB (float GiB; unset = no hard limit).
+    """
+    import os
+
+    try:
+        cache_gb = float(os.environ.get("AUTO_CHASM_MLX_CACHE_LIMIT_GB", _DEFAULT_CACHE_LIMIT_GB))
+        if cache_gb > 0:
+            mx.set_cache_limit(int(cache_gb * 1024**3))
+        mem_gb = os.environ.get("AUTO_CHASM_MLX_MEMORY_LIMIT_GB")
+        if mem_gb:
+            mx.set_memory_limit(int(float(mem_gb) * 1024**3))
+    except Exception as exc:  # noqa: BLE001 -- a memory hint must never break a run
+        logger.warning("Could not configure MLX memory limits: %s", exc)
+
+
 # Leaf parameter names that belong to a LoRA/DoRA adapter (never the wrapped base):
 # the low-rank factors and DoRA's magnitude vector.
 _ADAPTER_LEAVES = frozenset({"lora_a", "lora_b", "m"})

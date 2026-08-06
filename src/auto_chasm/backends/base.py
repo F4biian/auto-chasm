@@ -210,7 +210,15 @@ class Backend:
                 MLXModuleOps,
                 MLXOptimOps,
                 MLXTensorOps,
+                configure_mlx_memory,
             )
+
+            # Bound MLX's buffer cache the moment the backend is chosen -- this is
+            # the one place every MLX run passes through. Left unbounded it grows
+            # with every distinct tensor shape seen, and Metal's unified memory is
+            # invisible to `ps` RSS, so a run can drive a 64 GB machine to 0.4 GB
+            # free while reporting 2.7 GB.
+            configure_mlx_memory()
 
             self.tensor = MLXTensorOps()
             self.module = MLXModuleOps()
