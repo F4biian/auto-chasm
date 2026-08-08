@@ -35,7 +35,20 @@ def configure_mlx_memory() -> None:
     """Bound MLX's buffer cache. Idempotent; safe to call more than once.
 
     Reads AUTO_CHASM_MLX_CACHE_LIMIT_GB (float GiB; ``0`` = no cap) and
-    AUTO_CHASM_MLX_MEMORY_LIMIT_GB (float GiB; unset = no hard limit).
+    AUTO_CHASM_MLX_MEMORY_LIMIT_GB (float GiB; unset = leave MLX's default).
+
+    Use the CACHE limit. It bounds retained buffers and can never fail an
+    allocation, which is what actually stops the unbounded growth.
+
+    The MEMORY limit is a HARD WALL and is not a safety net: exceeding it makes
+    ``metal::malloc`` throw, the exception escapes through C++, and the process
+    dies with SIGABRT mid-training --
+
+        RuntimeError: [metal::malloc] Resource limit (...) exceeded.
+        libc++abi: terminating due to uncaught exception
+
+    Set it only to deliberately fail fast at a known ceiling, never to "be safe":
+    a value that merely looks generous will abort a long run hours in.
     """
     import os
 

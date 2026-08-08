@@ -54,17 +54,36 @@ def _find_layers(model: Any) -> Any:
     return None
 
 
-def _get_hidden_dim(model: Any) -> int:
-    """Infer hidden dimension from a model's config (raises if unknown)."""
-    config = getattr(model, "config", None)
-    for attr in ("hidden_size", "d_model", "n_embd", "dim"):
-        if config and hasattr(config, attr):
-            return int(getattr(config, attr))
+_HIDDEN_DIM_ATTRS = ("hidden_size", "d_model", "n_embd", "dim")
 
-    if hasattr(model, "args"):
-        for attr in ("hidden_size", "d_model"):
-            if hasattr(model.args, attr):
-                return int(getattr(model.args, attr))
+
+def _get_hidden_dim(model: Any) -> int:
+    """Infer hidden dimension from a model's config (raises if unknown).
+
+    Looks past WRAPPER architectures. Checking only ``model.config`` and
+    ``model.args`` misses shells that hold a sub-model: Qwen3.5's MLX build is a
+    multimodal-style wrapper whose ``args`` carries just a ``text_config``, with
+    the real size at ``model.language_model.args.hidden_size``. Probing such a
+    model failed outright, so the search also walks ``language_model``/``model``
+    and one ``text_config`` level down.
+    """
+    seen: list[Any] = []
+    for holder in (model, getattr(model, "language_model", None), getattr(model, "model", None)):
+        if holder is None:
+            continue
+        for cfg in (getattr(holder, "config", None), getattr(holder, "args", None)):
+            if cfg is None:
+                continue
+            seen.append(cfg)
+            seen.append(getattr(cfg, "text_config", None))
+
+    for cfg in seen:
+        if cfg is None:
+            continue
+        for attr in _HIDDEN_DIM_ATTRS:
+            value = getattr(cfg, attr, None)
+            if isinstance(value, int) and value > 0:
+                return int(value)
 
     raise ValueError(
         "Cannot determine hidden dimension. Pass module_config={'in_features': N} to ProbeConfig."

@@ -30,6 +30,25 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _explicit_in_features(config: Any) -> int | None:
+    """An ``in_features`` the caller put in ``module_config``, if any.
+
+    ``_get_hidden_dim``'s error tells the caller to "Pass
+    module_config={'in_features': N}" -- but nothing read it, so that advice did
+    not work. It does now, which also gives any exotic architecture an escape
+    hatch that needs no library change.
+
+    Args:
+        config: The ``ProbeConfig`` being attached.
+
+    Returns:
+        The declared input width, or None when unset.
+    """
+    module_config = getattr(config, "module_config", None) or {}
+    value = module_config.get("in_features")
+    return int(value) if isinstance(value, int) and value > 0 else None
+
+
 class Model:
     """User-facing model with probes and steering.
 
@@ -265,11 +284,11 @@ class Model:
             for idx in resolved:
                 # setdefault (not assign): don't let a 2nd probe overwrite the wrapped block.
                 self._original_layers.setdefault(idx, layers[idx])
-            in_dim = _get_hidden_dim(self.model)
+            in_dim = _explicit_in_features(config) or _get_hidden_dim(self.model)
         elif config.source == "logits":
             in_dim = _get_vocab_size(self.model)
         else:  # embedding
-            in_dim = _get_hidden_dim(self.model)
+            in_dim = _explicit_in_features(config) or _get_hidden_dim(self.model)
 
         if config.source in ("embedding", "logits"):  # record original for later unwrap
             from auto_chasm import _probe_inject
