@@ -164,8 +164,17 @@ class ModelWrapping(Protocol):
         """Save adapter weights to *path*."""
         ...
 
-    def load_adapters(self, model: Any, path: str) -> Any:
-        """Load adapter weights from *path*."""
+    def load_adapters(self, model: Any, path: str, strict: bool = True) -> Any:
+        """Load adapter weights from *path*.
+
+        Args:
+            model: The model to load into.
+            path: Adapter file.
+            strict: Raise if any key in the file has no matching model
+                parameter. Adapter files are loaded non-strictly (they hold
+                only the LoRA parameters), so an unmatched key would otherwise
+                be dropped in silence — see :mod:`auto_chasm._adapter_keys`.
+        """
         ...
 
     def get_trainable_params(self, model: Any) -> list[Any]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from auto_chasm._adapter_keys import check_adapter_keys
 from auto_chasm.logger import get_logger
 
 logger = get_logger(__name__)
@@ -356,7 +357,7 @@ class TorchModelWrapping:
         # cheap.
         save_file({k: v.detach().contiguous().clone() for k, v in state.items()}, path)
 
-    def load_adapters(self, model: Any, path: str) -> Any:
+    def load_adapters(self, model: Any, path: str, strict: bool = True) -> Any:
         """Load adapter weights from a single file.
 
         Loads LoRA parameters with ``strict=False`` so that only the
@@ -365,11 +366,16 @@ class TorchModelWrapping:
         Args:
             model: The base model (must already have LoRA applied).
             path: File path to load from.
+            strict: Raise if any key in the adapter file has no matching model
+                parameter. The load itself is non-strict (the file holds only
+                LoRA parameters), so an unmatched key would otherwise be
+                dropped in silence — see :mod:`auto_chasm._adapter_keys`.
 
         Returns:
             Model with loaded adapter weights.
         """
         state = _load_tensor_file(path)
+        check_adapter_keys(path, set(state), set(model.state_dict()), strict)
         model.load_state_dict(state, strict=False)
         return model
 

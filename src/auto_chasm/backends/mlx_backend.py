@@ -13,6 +13,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
+from auto_chasm._adapter_keys import check_adapter_keys
 from auto_chasm._mlx_compat import ensure_mlx_lm_compat
 from auto_chasm.logger import get_logger
 
@@ -377,7 +378,7 @@ class MLXModelWrapping:
             )
         mx.save_safetensors(path, adapter_dict)
 
-    def load_adapters(self, model: nn.Module, path: str) -> nn.Module:
+    def load_adapters(self, model: nn.Module, path: str, strict: bool = True) -> nn.Module:
         """Load adapter weights into a model.
 
         Uses ``Module.load_weights(..., strict=False)`` — the adapter file holds
@@ -390,6 +391,10 @@ class MLXModelWrapping:
         Args:
             model: The model to load adapters into (LoRA already applied).
             path: Path to the adapter safetensors file.
+            strict: Raise if any key in the adapter file has no matching model
+                parameter. The load itself is non-strict (the file holds only
+                LoRA parameters), so an unmatched key would otherwise be
+                dropped in silence — see :mod:`auto_chasm._adapter_keys`.
 
         Returns:
             The model with loaded adapter weights.
@@ -402,12 +407,7 @@ class MLXModelWrapping:
 
         file_keys = set(mx.load(path).keys())
         model_keys = {k for k, _ in tree_flatten(model.parameters())}
-        if file_keys and file_keys.isdisjoint(model_keys):
-            raise ValueError(
-                f"Adapter file {path!r} has no parameters matching the model "
-                f"(e.g. {next(iter(file_keys))!r}). The LoRA config or base model "
-                "does not match what produced these adapters."
-            )
+        check_adapter_keys(path, file_keys, model_keys, strict)
         model.load_weights(path, strict=False)
         return model
 
