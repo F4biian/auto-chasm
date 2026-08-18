@@ -82,6 +82,11 @@ def train_torch(
     patience_counter = 0
     best_iter = 0
     best_state: dict[str, Any] | None = None
+    from auto_chasm import _grad_checkpoint
+
+    _warning = _grad_checkpoint.memory_warning(getattr(trainer.model, "model", trainer.model))
+    if _warning and trainer.verbose:
+        print(f"  [memory] {_warning}")
     es_active = trainer.early_stopping_patience > 0 and val_data is not None
     eval_steps = trainer.eval_steps if trainer.eval_steps is not None else trainer.save_steps
     wall_start = time.perf_counter()

@@ -471,6 +471,57 @@ For **per-layer** early stopping — each layer's head kept at *its own* best st
 [`LayerSweep`](#lora-checkpoints--layer-sweeps), which snapshots every layer
 independently.
 
+### Activation memory & gradient checkpointing
+
+If a run dies with `zsh: killed` (the OS OOM killer) or
+`[metal::malloc] Resource limit (499000) exceeded`, the cause is almost always
+**activation memory**, not parameter count:
+
+```python
+model.enable_gradient_checkpointing()      # before training; call once
+```
+
+Only each block's input is kept and the interior is recomputed during backward.
+Measured on Qwen3.5-0.8B (MLX, LoRA r=8, batch 1):
+
+| sequence | peak, off | peak, on | saving | step time |
+|---|---|---|---|---|
+| 253 tok | 11.95 GB | 3.28 GB | **3.6×** | 1.26× slower |
+| 628 tok | 29.68 GB | 7.78 GB | **3.8×** | 1.15× slower |
+| 1243 tok | 64.62 GB | 21.58 GB | **3.0×** | *faster* — the un-checkpointed run was swapping |
+
+<details>
+<summary>Why some models need far more memory than their size suggests</summary>
+
+Peak memory scales with **sequence length × batch size**, and the constant depends
+on the architecture. A dense model is modest — Qwen2.5-0.5B measures ~5 MB/token.
+A **linear-attention / state-space** model can be an order of magnitude worse:
+Qwen3.5-0.8B measures **~48 MB/token**, so a 0.8B model exhausts 64 GB at ~1300
+tokens.
+
+The reason is not the loss and not gradient accumulation (measured: unlikelihood
+weights cost 0.00 GB extra; going from 1 to 4 accumulation steps costs 0.6 GB).
+Those blocks are implemented with a fused kernel that has **no backward**, so the
+differentiable path is an unrolled loop over timesteps — in mlx-lm,
+`gated_delta_update(..., use_kernel=not self.training)`. Each timestep's
+`[B, heads, Dv, Dk]` state is then retained for backward: for Qwen3.5-0.8B that is
+1.0 MB per timestep per layer across 18 such layers, i.e. 18 MB/token of state
+before counting the other per-step intermediates.
+
+The same unrolled loop multiplies the number of distinct buffers in one graph,
+which is what surfaces as `[metal::malloc] Resource limit (499000) exceeded` at
+longer sequences or higher `grad_accum_steps`.
+
+The trainer detects such blocks and prints a `[memory]` line naming the cause
+before the first step, rather than letting the run die unexplained. The PyTorch
+path is not affected the same way: transformers implements these layers with a
+chunked algorithm in plain autograd-differentiable ops.
+
+**Other levers**, in order of effect: shorter `max_seq_length` (peak is linear in
+it), `batch_size=1` (also linear), then checkpointing. Raising `grad_accum_steps`
+does **not** trade memory here and high values can trip the buffer-count limit.
+</details>
+
 ### Mixed precision
 
 Train the frozen base in half precision while the trainable probe/adapter params and

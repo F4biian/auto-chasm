@@ -335,6 +335,14 @@ class JointTrainer:
             f"Starting training: {self.num_iters} iters, "
             f"batch_size={self.batch_size}, lr={self._base_lr:.2e}"
         )
+        # Warn BEFORE the first step: on a linear-attention model the failure is a
+        # SIGKILL or an opaque metal::malloc error several minutes in, with nothing
+        # pointing at the cause.
+        from auto_chasm import _grad_checkpoint
+
+        _warning = _grad_checkpoint.memory_warning(self.wrapper.model)
+        if _warning:
+            self._log(f"  [memory] {_warning}")
         if es_active:
             self._log(
                 f"  Early stopping: patience={self.early_stopping_patience}, "

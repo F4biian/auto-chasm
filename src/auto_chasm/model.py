@@ -719,6 +719,33 @@ class Model:
         self._steering_hooks.clear()
         self._probes.clear()
 
+    def enable_gradient_checkpointing(self) -> int:
+        """Trade ~30% step time for a large cut in activation memory.
+
+        Without checkpointing every block's intermediates are held until backward,
+        so peak memory grows LINEARLY with sequence length and batch size —
+        measured at ~42 MB per token on Qwen3.5-0.8B, which is what puts a 0.8B
+        model out of memory on a 64 GB machine. Checkpointing keeps only each
+        block's input and recomputes the interior during backward.
+
+        Call it BEFORE training (order relative to ``attach_probe`` /
+        ``attach_lora`` does not matter). See
+        :func:`auto_chasm._grad_checkpoint.enable` for the MLX class-patching
+        caveat.
+
+        Returns:
+            Number of block types patched (MLX) or ``1`` (torch).
+        """
+        from auto_chasm import _grad_checkpoint
+
+        return int(_grad_checkpoint.enable(self.model, self.backend.name))
+
+    def disable_gradient_checkpointing(self) -> int:
+        """Undo :meth:`enable_gradient_checkpointing`."""
+        from auto_chasm import _grad_checkpoint
+
+        return int(_grad_checkpoint.disable(self.model, self.backend.name))
+
     @property
     def num_layers(self) -> int:
         """Number of transformer layers in the underlying model."""
