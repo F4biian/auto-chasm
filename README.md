@@ -397,7 +397,8 @@ trainer = Trainer(
     batch_size=4,
     learning_rate=2e-4,
     eval_steps=50,                       # evaluate val every 50 steps
-    early_stopping_patience=4,           # stop after 4 evals without improvement
+    early_stopping_patience=4,           # opt in: stop after 4 evals without improvement
+    restore_best_weights=True,           # opt in: end on the best checkpoint, not the last step
 )
 result = trainer.train(train, val_data=val, test_data=test)
 history = result["history"]              # per-step losses, val metrics, best checkpoint
@@ -427,17 +428,33 @@ JointLoss(losses={"topic": "ce"}, class_weights=weights)
 JointLoss(losses={"topic": "ce"}, class_weights="balanced")   # Trainer.train computes it from train_data
 ```
 
-### Early stopping
+### Early stopping and best-checkpoint restore
 
-`Trainer` stops when the monitored metric stops improving and **restores the best
-checkpoint**:
+**Both are off by default.** A run trains for the full `num_iters` and you keep the
+**final-step weights** — which is what a fixed-budget run means, and what you want
+whenever the monitored metric is not expected to fall monotonically (unlikelihood /
+unlearning runs are the clear case: the val loss there rises by construction).
+
+They are two independent switches:
 
 ```python
 Trainer(model=model, loss_fn=..., eval_steps=50,
-        early_stopping_patience=4,             # evals without improvement before stopping
+        early_stopping_patience=4,             # 0 (default) = never stop early
+        restore_best_weights=True,             # False (default) = keep the final step
         early_stopping_metric="val_loss",      # what to monitor
         min_delta=1e-4)
 ```
+
+`early_stopping_patience` decides whether training *stops sooner*;
+`restore_best_weights` decides *which weights you end up with*. Enabling early
+stopping alone leaves you at the stopping point, not at the best step — set both if
+you want the classic behaviour.
+
+Best-val tracking runs whenever `val_data` and `eval_steps` are given, regardless of
+either flag, so `best_iter` is always reported in `training_manifest.json`
+(alongside `restore_best_weights`, recording which weights the manifest describes).
+Only the rollback is opt-in. To skip the tracking entirely, pass `eval_steps=0` or
+omit `val_data`.
 
 To early-stop on a probe metric (accuracy, F1) instead of the loss, pass an
 `eval_metrics_fn` and monitor its key with the right direction:
@@ -481,7 +498,9 @@ Trainer(
     learning_rate=2e-4, weight_decay=0.0, grad_clip_norm=1.0,
     num_iters=500, batch_size=8, max_seq_length=256, grad_accum_steps=1,
     logging_steps=25, save_steps=100, eval_steps=None,
-    early_stopping_patience=15, early_stopping_metric="val_loss",
+    early_stopping_patience=0,                       # 0 = disabled (default)
+    restore_best_weights=False,                      # False = keep final-step weights (default)
+    early_stopping_metric="val_loss",
     early_stopping_higher_is_better=False, min_delta=1e-4,
     keep_best_only=False, save_history=True, output_dir="./checkpoints",
     lr_schedule="cosine", warmup_ratio=0.0,          # "cosine" | "linear" | "constant"

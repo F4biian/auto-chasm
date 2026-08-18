@@ -223,11 +223,17 @@ def train_torch(
             path = trainer.output_dir / f"{global_step:07d}_adapters.pt"
             torch.save(model.state_dict(), path)
 
-    # --- Restore best ---
-    if best_state is not None:
+    # --- Restore best (OPT-IN, and it must stay in lockstep with the MLX loop) ---
+    # Best-val tracking above is deliberately ungated so ``best_iter`` is always
+    # reported; the ROLLBACK is what the caller opts into. Defaulting this to on
+    # silently rewound fixed-budget runs to whichever eval happened to score best.
+    if best_state is not None and trainer.restore_best_weights:
         model.load_state_dict(best_state, _strict=False)
         if trainer.verbose:
             print(f"Restored best checkpoint from step {best_iter}.")
+    elif best_state is not None and trainer.verbose:
+        print(f"Kept final-step weights (best was step {best_iter}; "
+              f"pass restore_best_weights=True to roll back to it).")
 
     # --- Save best checkpoint ---
     from auto_chasm.checkpoint import save_checkpoint
@@ -252,6 +258,7 @@ def train_torch(
         early_stopping_patience=trainer.early_stopping_patience,
         min_delta=trainer.min_delta,
         keep_best_only=trainer.keep_best_only,
+        restore_best_weights=trainer.restore_best_weights,
     )
     finalize_torch_run(
         output_dir=trainer.output_dir,

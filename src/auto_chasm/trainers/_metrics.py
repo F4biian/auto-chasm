@@ -70,6 +70,7 @@ def torch_manifest(
     early_stopping_patience: int,
     min_delta: float,
     keep_best_only: bool,
+    restore_best_weights: bool = False,
 ) -> dict[str, Any]:
     """Build the torch training manifest dict.
 
@@ -82,6 +83,8 @@ def torch_manifest(
         early_stopping_patience: Early-stopping patience.
         min_delta: Early-stopping minimum delta.
         keep_best_only: Whether periodic checkpoints were removed.
+        restore_best_weights: Whether the saved weights are the best-scoring
+            checkpoint (``True``) or the final step (``False``, the default).
 
     Returns:
         The manifest dict (JSON-safe; non-finite metrics become ``None``).
@@ -99,6 +102,8 @@ def torch_manifest(
         "early_stopping_patience": early_stopping_patience,
         "min_delta": min_delta,
         "keep_best_only": keep_best_only,
+        # Which weights this manifest describes: rolled back to best, or final.
+        "restore_best_weights": restore_best_weights,
     }
 
 
@@ -378,6 +383,7 @@ def write_training_manifest(trainer: Any, best_iter: int, best_metric: float) ->
         "early_stopping_patience": trainer.early_stopping_patience,
         "min_delta": trainer.min_delta,
         "keep_best_only": trainer.keep_best_only,
+        "restore_best_weights": trainer.restore_best_weights,
     }
     path = Path(trainer.output_dir) / "training_manifest.json"
     with open(path, "w") as f:

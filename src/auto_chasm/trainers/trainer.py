@@ -63,7 +63,12 @@ class Trainer:
         eval_steps: Evaluate every N steps.  0 disables mid-training eval.
             Defaults to ``save_steps`` if ``None``.
         early_stopping_patience: Stop after N eval rounds without improvement.
-            0 disables early stopping.
+            0 (the default) disables early stopping.
+        restore_best_weights: If ``True``, reload the best-scoring checkpoint at
+            the end of ``train()``. Default ``False`` — the FINAL-step weights
+            are what you get, which is what a fixed-budget run almost always
+            wants. Best-val tracking still happens (``best_iter`` is reported in
+            the manifest) so the diagnostic survives; only the rollback is opt-in.
         early_stopping_metric: Metric to monitor (``"val_loss"``, ``"val_f1"``, etc.).
         early_stopping_higher_is_better: If ``True``, maximize the metric (for F1, accuracy);
             if ``False``, minimize (for loss, perplexity).  Default ``False``.
@@ -105,7 +110,8 @@ class Trainer:
         logging_steps: int = _UNSET,
         save_steps: int = _UNSET,
         eval_steps: int | None = _UNSET,
-        early_stopping_patience: int = 15,
+        early_stopping_patience: int = 0,
+        restore_best_weights: bool = False,
         early_stopping_metric: str = "val_loss",
         early_stopping_higher_is_better: bool = False,
         min_delta: float = 1e-4,
@@ -146,6 +152,7 @@ class Trainer:
         self.num_iters = num_iters
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
+        self.restore_best_weights = restore_best_weights
         self.early_stopping_metric = early_stopping_metric
         self.early_stopping_higher_is_better = early_stopping_higher_is_better
         self.min_delta = min_delta
@@ -380,6 +387,7 @@ class Trainer:
                 save_steps=self.save_steps,
                 eval_steps=self.eval_steps,
                 early_stopping_patience=self.early_stopping_patience,
+                restore_best_weights=self.restore_best_weights,
                 early_stopping_metric=self.early_stopping_metric,
                 early_stopping_higher_is_better=self.early_stopping_higher_is_better,
                 min_delta=self.min_delta,
@@ -427,6 +435,7 @@ class Trainer:
             save_steps=self.save_steps,
             eval_steps=self.eval_steps,
             early_stopping_patience=self.early_stopping_patience,
+            restore_best_weights=self.restore_best_weights,
             early_stopping_metric=self.early_stopping_metric,
             early_stopping_higher_is_better=self.early_stopping_higher_is_better,
             min_delta=self.min_delta,

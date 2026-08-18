@@ -69,7 +69,12 @@ class JointTrainer:
         eval_steps: Evaluate every N steps.  0 disables mid-training eval.
             If ``None``, defaults to ``save_steps``.
         early_stopping_patience: Stop after N eval rounds without improvement.
-            0 disables early stopping.
+            0 (the default) disables early stopping.
+        restore_best_weights: If ``True``, reload the best-scoring checkpoint at
+            the end of ``train()``. Default ``False`` — the FINAL-step weights
+            are what you get, which is what a fixed-budget run almost always
+            wants. Best-val tracking still happens (``best_iter`` is reported in
+            the manifest) so the diagnostic survives; only the rollback is opt-in.
         early_stopping_metric: Metric to monitor: ``"val_loss"`` (default) or a metric
             your ``eval_metrics_fn`` emits, keyed ``"val_<probe>_<name>"`` (e.g.
             ``"val_digit_macro_f1"``).
@@ -110,7 +115,8 @@ class JointTrainer:
         logging_steps: int = _UNSET,
         save_steps: int = _UNSET,
         eval_steps: int | None = None,
-        early_stopping_patience: int = 15,
+        early_stopping_patience: int = 0,
+        restore_best_weights: bool = False,
         early_stopping_metric: str = "val_loss",
         early_stopping_higher_is_better: bool = False,
         min_delta: float = 1e-4,
@@ -143,6 +149,7 @@ class JointTrainer:
         self.num_iters = num_iters
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
+        self.restore_best_weights = restore_best_weights
         self.early_stopping_metric = early_stopping_metric
         self.early_stopping_higher_is_better = early_stopping_higher_is_better
         self.min_delta = min_delta
@@ -499,12 +506,21 @@ class JointTrainer:
                 self._save_checkpoint(adapter_file, it)
 
         self._train_model.restore_capture_fns()
-        # Restore the best checkpoint ONLY if THIS run saved one. Otherwise the newly
-        # trained weights stand — never load a leftover best-file from a previous run
-        # into (e.g.) a LayerSweep pass that saves no best of its own.
-        if saved_best:
+        # OPT-IN rollback. The final-step weights stand unless the caller asked for
+        # the best-scoring checkpoint: a fixed-budget run that merely logs a val
+        # curve used to be silently rewound to whichever eval scored best, which is
+        # not what "train for N iters" means and is actively wrong for an unlearning
+        # run (val loss there is not monotone by construction). `saved_best` still
+        # guards it, so a leftover best-file from a previous run is never loaded
+        # into (e.g.) a LayerSweep pass that saved no best of its own.
+        if saved_best and self.restore_best_weights:
             self._restore_best(adapter_file)
-            self._log(f"Training complete. Best {self.early_stopping_metric} at iter {best_iter}.")
+            self._log(f"Training complete. Restored best {self.early_stopping_metric} "
+                      f"from iter {best_iter}.")
+        elif saved_best:
+            self._log(f"Training complete. Kept final-step weights "
+                      f"(best {self.early_stopping_metric} was at iter {best_iter}; "
+                      f"pass restore_best_weights=True to roll back to it).")
         else:
             self._log("Training complete.")
 

@@ -59,7 +59,13 @@ class SFTTrainer:
         grad_accum_steps: Gradient accumulation steps.
         logging_steps: Log metrics every N steps.
         save_steps: Save checkpoint every N steps.
-        early_stopping_patience: Early stopping patience.
+        early_stopping_patience: Stop after N eval rounds without improvement.
+            0 (the default) disables early stopping.
+        restore_best_weights: If ``True``, reload the best-scoring checkpoint at
+            the end of ``train()``. Default ``False`` — the FINAL-step weights
+            are what you get, which is what a fixed-budget run almost always
+            wants. Best-val tracking still happens (``best_iter`` is reported in
+            the manifest) so the diagnostic survives; only the rollback is opt-in.
         early_stopping_metric: Metric for early stopping.
         early_stopping_higher_is_better: If ``True``, maximize the metric.
         eval_steps: Evaluate every N steps.  ``None`` defaults to ``save_steps``.
@@ -96,7 +102,8 @@ class SFTTrainer:
         logging_steps: int = _UNSET,
         save_steps: int = _UNSET,
         eval_steps: int | None = None,
-        early_stopping_patience: int = 15,
+        early_stopping_patience: int = 0,
+        restore_best_weights: bool = False,
         early_stopping_metric: str = "val_loss",
         early_stopping_higher_is_better: bool = False,
         lr_schedule: str = _UNSET,
@@ -149,6 +156,7 @@ class SFTTrainer:
             save_steps=save_steps,
             eval_steps=eval_steps,
             early_stopping_patience=early_stopping_patience,
+            restore_best_weights=restore_best_weights,
             early_stopping_metric=early_stopping_metric,
             early_stopping_higher_is_better=early_stopping_higher_is_better,
             lr_schedule=lr_schedule,
