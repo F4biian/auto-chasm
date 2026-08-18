@@ -1,6 +1,6 @@
 [project]
 name = "auto-chasm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Attach probe heads to a language model and jointly train them with the base — cross-backend (MLX + PyTorch)"
 readme = "README.md"
 requires-python = ">=3.10"
