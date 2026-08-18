@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from auto_chasm.probe import _find_embedding, _get_hidden_dim, _get_vocab_size
+from auto_chasm.probe import _find_embedding, _get_hidden_dim, _get_vocab_size, config_holders
 from auto_chasm.utils import tensor_backend
 
 
@@ -36,11 +36,17 @@ def vocab_size(base: Any) -> int:
 
 
 def _cfg_value(base: Any, names: tuple[str, ...]) -> int | None:
-    """First integer config value found under any of ``names`` (else ``None``)."""
-    for holder in (getattr(base, "config", None), getattr(base, "args", None)):
+    """First integer config value found under any of ``names`` (else ``None``).
+
+    Searches wrapper sub-models too (see :func:`~auto_chasm.probe.config_holders`):
+    on a shell like Qwen3.5's MLX build the top-level ``args`` holds only
+    ``{model_type, text_config}``, so the direct lookup silently reported ``None``
+    for every dimension in ``stats()`` rather than the real value.
+    """
+    for cfg in config_holders(base):
         for name in names:
-            value = getattr(holder, name, None)
-            if value is not None:
+            value = getattr(cfg, name, None)
+            if isinstance(value, int) and value > 0:
                 return int(value)
     return None
 

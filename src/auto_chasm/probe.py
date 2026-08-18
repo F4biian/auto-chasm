@@ -57,29 +57,53 @@ def _find_layers(model: Any) -> Any:
 _HIDDEN_DIM_ATTRS = ("hidden_size", "d_model", "n_embd", "dim")
 
 
-def _get_hidden_dim(model: Any) -> int:
-    """Infer hidden dimension from a model's config (raises if unknown).
+#: Sub-model attributes a wrapper architecture hides the real model behind, in
+#: search order. ``""`` is the model itself, so an unwrapped model is unaffected.
+_SUBMODEL_PATHS: tuple[str, ...] = ("", "language_model", "model", "model.model",
+                                    "language_model.model")
 
-    Looks past WRAPPER architectures. Checking only ``model.config`` and
-    ``model.args`` misses shells that hold a sub-model: Qwen3.5's MLX build is a
-    multimodal-style wrapper whose ``args`` carries just a ``text_config``, with
-    the real size at ``model.language_model.args.hidden_size``. Probing such a
-    model failed outright, so the search also walks ``language_model``/``model``
-    and one ``text_config`` level down.
+
+def _resolve_path(model: Any, path: str) -> Any | None:
+    """Walk a dotted attribute path; ``None`` if any component is missing."""
+    obj = model
+    for part in filter(None, path.split(".")):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def config_holders(model: Any) -> list[Any]:
+    """Every config-like object on a model, wrapper sub-models included.
+
+    Checking only ``model.config`` and ``model.args`` misses shells that hold a
+    sub-model: Qwen3.5's MLX build is a multimodal-style wrapper whose ``args``
+    carries just ``{model_type, text_config}``, with the real dimensions at
+    ``model.language_model.args``. Reading a dimension off such a model returned
+    nothing -- ``hidden_size`` raised, and ``num_attention_heads`` silently
+    reported ``None``.
+
+    Ordered OUTERMOST FIRST, so a wrapper that does expose a value still wins and
+    behaviour on unwrapped models is unchanged.
     """
     seen: list[Any] = []
-    for holder in (model, getattr(model, "language_model", None), getattr(model, "model", None)):
+    for path in _SUBMODEL_PATHS:
+        holder = _resolve_path(model, path)
         if holder is None:
             continue
         for cfg in (getattr(holder, "config", None), getattr(holder, "args", None)):
             if cfg is None:
                 continue
             seen.append(cfg)
-            seen.append(getattr(cfg, "text_config", None))
+            sub = getattr(cfg, "text_config", None)
+            if sub is not None:
+                seen.append(sub)
+    return seen
 
-    for cfg in seen:
-        if cfg is None:
-            continue
+
+def _get_hidden_dim(model: Any) -> int:
+    """Infer hidden dimension from a model's config (raises if unknown)."""
+    for cfg in config_holders(model):
         for attr in _HIDDEN_DIM_ATTRS:
             value = getattr(cfg, attr, None)
             if isinstance(value, int) and value > 0:
@@ -92,19 +116,36 @@ def _get_hidden_dim(model: Any) -> int:
 
 def _get_vocab_size(model: Any) -> int:
     """Infer vocabulary size from a model's config (raises if unknown)."""
-    config = getattr(model, "config", None)
-    for attr in ("vocab_size", "n_vocab", "vocabulary_size", "num_embeddings"):
-        if config and hasattr(config, attr):
-            return int(getattr(config, attr))
-
-    if hasattr(model, "args"):
-        for attr in ("vocab_size", "n_vocab"):
-            if hasattr(model.args, attr):
-                return int(getattr(model.args, attr))
+    for cfg in config_holders(model):
+        for attr in ("vocab_size", "n_vocab", "vocabulary_size", "num_embeddings"):
+            value = getattr(cfg, attr, None)
+            if isinstance(value, int) and value > 0:
+                return int(value)
 
     raise ValueError(
-        "Cannot determine vocabulary size. Pass module_config={'in_features': N} to ProbeConfig."
+        "Cannot determine vocabulary size: no config on this model or its sub-models "
+        f"exposes vocab_size/n_vocab (searched {len(config_holders(model))} config objects). "
+        "Pass module_config={'out_features': N} to ProbeConfig to set it explicitly."
     )
+
+
+def _find_in_submodels(model: Any, names: tuple[str, ...]) -> tuple[Any | None, str | None]:
+    """First ``(module, dotted_path)`` matching any of ``names``, wrappers included.
+
+    Tries every name at the model itself before descending, so an unwrapped model
+    resolves to the same short path it always did; the returned path is dotted and
+    is resolved generically by ``_set_module_by_path``, so deeper hits restore
+    correctly.
+    """
+    for path in _SUBMODEL_PATHS:
+        holder = _resolve_path(model, path)
+        if holder is None:
+            continue
+        for name in names:
+            found = getattr(holder, name, None)
+            if found is not None:
+                return found, f"{path}.{name}" if path else name
+    return None, None
 
 
 def _find_embedding(model: Any) -> tuple[Any | None, str | None]:
@@ -117,26 +158,14 @@ def _find_embedding(model: Any) -> tuple[Any | None, str | None]:
         Tuple ``(module, attr_path)`` (dotted path, e.g. ``"embed_tokens"``),
         or ``(None, None)`` if not found.
     """
-    for attr in ("embedding", "embed_tokens", "wte"):
-        if hasattr(model, attr):
-            return getattr(model, attr), attr
-
-    # ``model.embed_tokens`` for a plain HF causal-LM; ``model.model.embed_tokens``
-    # once a torch PeftModel wrapper (get_peft_model) nests the base one level deeper
-    # — without the deeper path an embedding-source probe cannot attach after LoRA,
-    # which broke Model.from_checkpoint reloads (probes are restored after adapters).
-    for attr in ("model.embed_tokens", "model.model.embed_tokens"):
-        parts = attr.split(".")
-        obj = model
-        for part in parts:
-            if hasattr(obj, part):
-                obj = getattr(obj, part)
-            else:
-                break
-        else:
-            return obj, attr
-
-    return None, None
+    # Searched across WRAPPER sub-models too: ``model.embed_tokens`` for a plain
+    # HF causal-LM, ``model.model.embed_tokens`` once a torch PeftModel wrapper
+    # (get_peft_model) nests the base one level deeper — without the deeper path
+    # an embedding-source probe cannot attach after LoRA, which broke
+    # Model.from_checkpoint reloads (probes are restored after adapters) — and
+    # ``language_model.model.embed_tokens`` for Qwen3.5's multimodal-style shell,
+    # where the plain search returned (None, None) and probing failed outright.
+    return _find_in_submodels(model, ("embedding", "embed_tokens", "wte"))
 
 
 def _find_output_head(model: Any) -> tuple[Any | None, str | None]:
@@ -149,22 +178,7 @@ def _find_output_head(model: Any) -> tuple[Any | None, str | None]:
         Tuple ``(module, attr_path)`` (dotted path, e.g. ``"lm_head"``), or
         ``(None, None)`` if not found.
     """
-    for attr in ("output_proj", "lm_head", "output", "head"):
-        if hasattr(model, attr):
-            return getattr(model, attr), attr
-
-    for attr in ("model.lm_head",):
-        parts = attr.split(".")
-        obj = model
-        for part in parts:
-            if hasattr(obj, part):
-                obj = getattr(obj, part)
-            else:
-                break
-        else:
-            return obj, attr
-
-    return None, None
+    return _find_in_submodels(model, ("output_proj", "lm_head", "output", "head"))
 
 
 # Attribute names a transformer block uses for its attention / MLP submodule,
