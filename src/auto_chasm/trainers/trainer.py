@@ -470,12 +470,36 @@ class Trainer:
         test_metrics: dict[str, float] | None = None
         if test_data is not None:
             test_metrics = self._evaluate_mlx(test_data)
+            # Record it in the HISTORY too, not only in the returned dict.
+            # HistoryEntry has always advertised test_loss/test_metrics, and the
+            # MLX path never filled them -- so training_history.json showed them
+            # as null even when test_data WAS evaluated, which reads as "the test
+            # set was ignored". Merged into the final step's entry.
+            self._record_test_metrics(history, test_metrics)
 
         return {
             "history": history,
             "test_metrics": test_metrics,
             "output_dir": str(self.output_dir),
         }
+
+    def _record_test_metrics(self, history: Any, test_metrics: dict[str, float]) -> None:
+        """Merge test metrics into the history's final step and RE-SAVE the file.
+
+        The history JSON is written during training, before the test pass runs, so
+        without this the on-disk file never sees the test numbers even though the
+        returned History object would.
+        """
+        from auto_chasm.history import HistoryEntry
+
+        step = history.entries[-1].step if len(history) else 0
+        history.record(
+            HistoryEntry(
+                step=step, test_loss=test_metrics.get("loss"), test_metrics=dict(test_metrics)
+            )
+        )
+        if self.save_history:
+            history.save_json(Path(self.output_dir) / "training_history.json")
 
     def _evaluate_mlx(self, dataset: Any) -> dict[str, float]:
         """Evaluate on a dataset (MLX)."""

@@ -437,7 +437,7 @@ class JointTrainer:
                 self._log(f"Iter {it}: {', '.join(val_parts)}")
 
                 # Record val metrics in history
-                history.append(
+                history.record(
                     HistoryEntry(
                         step=it,
                         val_loss=val_metrics["loss"],
@@ -532,7 +532,7 @@ class JointTrainer:
                     f"LR {lr:.3e}, It/sec {it_sec:.3f}, Tokens/sec {tokens_sec:.1f}"
                 )
 
-                history.append(
+                history.record(
                     HistoryEntry(
                         step=it,
                         train_loss=train_loss,

@@ -50,25 +50,34 @@ class HistoryEntry:
     custom: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to a JSON-compatible dict.
+        """Serialize to a JSON-compatible dict, OMITTING fields that hold nothing.
+
+        A step that only logged training loss has no validation numbers, and a
+        step that only evaluated has no throughput. Writing those out as ``null``
+        and ``{}`` tripled the file's size and made a real ``null`` (a metric that
+        was computed and came back undefined) indistinguishable from "not measured
+        here". ``from_dict`` defaults every field, so the round-trip is unchanged.
 
         Returns:
-            Dict with all fields, suitable for ``json.dumps``.
+            Dict with ``step`` plus whatever else this entry actually recorded.
         """
-        return {
-            "step": self.step,
-            "train_loss": self.train_loss,
-            "loss_components": dict(self.loss_components),
-            "val_loss": self.val_loss,
-            "val_metrics": dict(self.val_metrics),
-            "test_loss": self.test_loss,
-            "test_metrics": dict(self.test_metrics),
-            "learning_rate": self.learning_rate,
-            "it_sec": self.it_sec,
-            "tokens_sec": self.tokens_sec,
-            "wall_time": self.wall_time,
-            "custom": dict(self.custom),
-        }
+        out: dict[str, Any] = {"step": self.step}
+        for key, value in (
+            ("train_loss", self.train_loss),
+            ("loss_components", dict(self.loss_components)),
+            ("val_loss", self.val_loss),
+            ("val_metrics", dict(self.val_metrics)),
+            ("test_loss", self.test_loss),
+            ("test_metrics", dict(self.test_metrics)),
+            ("learning_rate", self.learning_rate),
+            ("it_sec", self.it_sec),
+            ("tokens_sec", self.tokens_sec),
+            ("wall_time", self.wall_time),
+            ("custom", dict(self.custom)),
+        ):
+            if value is not None and value != {}:
+                out[key] = value
+        return out
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> HistoryEntry:
@@ -108,12 +117,41 @@ class History:
         self._entries: list[HistoryEntry] = []
 
     def append(self, entry: HistoryEntry) -> None:
-        """Add an entry to the history.
+        """Add an entry unconditionally (no merging). See :meth:`record`.
 
         Args:
             entry: The history entry to add.
         """
         self._entries.append(entry)
+
+    def record(self, entry: HistoryEntry) -> HistoryEntry:
+        """Add ``entry``, MERGING it into an existing entry for the same step.
+
+        The training loop reports validation and throughput from two different
+        places in the iteration, so with ``eval_steps == logging_steps`` every
+        step used to produce TWO entries -- one holding val numbers with the train
+        fields null, one the reverse. Anything plotting "loss vs step" then had to
+        stitch them back together. One step is now one row.
+
+        Only fields that carry something overwrite the existing entry, so the
+        merge never nulls out what the earlier half recorded.
+
+        Args:
+            entry: The snapshot to record.
+
+        Returns:
+            The stored entry (the merged one when a same-step entry existed).
+        """
+        for existing in reversed(self._entries):
+            if existing.step != entry.step:
+                break
+            for key, value in vars(entry).items():
+                if key == "step" or value is None or value == {}:
+                    continue
+                setattr(existing, key, value)
+            return existing
+        self._entries.append(entry)
+        return entry
 
     @property
     def entries(self) -> list[HistoryEntry]:

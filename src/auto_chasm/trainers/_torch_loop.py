@@ -140,7 +140,7 @@ def train_torch(
             if trainer.verbose:
                 print(f"Step {global_step}: loss={loss_val:.4f} ({comp_parts}), LR {lr:.3e}")
 
-            history.append(
+            history.record(
                 HistoryEntry(
                     step=global_step,
                     train_loss=loss_val,
@@ -174,7 +174,7 @@ def train_torch(
             # MLX loop). Mutating history[-1] mis-attributed them to the last *logging*
             # entry — a different step when eval_steps != logging_steps — and dropped
             # them entirely when no logging entry existed yet (e.g. first eval).
-            history.append(
+            history.record(
                 HistoryEntry(
                     step=global_step,
                     val_loss=val_loss,
@@ -279,6 +279,10 @@ def train_torch(
     test_metrics: dict[str, float] | None = None
     if test_data is not None:
         test_metrics = trainer._evaluate_torch(test_data)
+        # Same as the MLX path: put it in the HISTORY, not only the return value,
+        # so training_history.json stops showing test_metrics as empty when the
+        # test set was in fact evaluated.
+        trainer._record_test_metrics(history, test_metrics)
 
     return {
         "history": history,
