@@ -522,6 +522,18 @@ before the first step, rather than letting the run die unexplained. The PyTorch
 path is not affected the same way: transformers implements these layers with a
 chunked algorithm in plain autograd-differentiable ops.
 
+**The same architecture also breaks `mx.compile`.** The MLX training step is
+compiled, and `mx.compile` retains one graph per input *shape*; batches are padded
+to a 32-token boundary, so a run sees roughly `max_seq_length / 32` shapes. For a
+dense model those graphs are small. For an unrolled recurrence each is
+`T x n_blocks` nodes, and the retained set crosses Metal's 499000-buffer ceiling a
+few hundred iterations in — with tens of GB still free, and only after any short
+smoke test has passed. Measured on Qwen3.5-0.8B (18 such blocks,
+`max_seq_length=1280`, ~40 shapes): dies at iteration ~170 compiled, completes
+uncompiled. The trainer therefore skips compilation on these models and says so;
+`compile_step=True` forces it back on, `compile_step=False` off. Uncompiled costs
+memory — 46 GB peak versus 20 GB — because compilation fuses intermediates away.
+
 **Other levers**, in order of effect: shorter `max_seq_length` (peak is linear in
 it), `batch_size=1` (also linear), then checkpointing. Raising `grad_accum_steps`
 does **not** trade memory here and high values can trip the buffer-count limit.

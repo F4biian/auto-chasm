@@ -146,3 +146,42 @@ def test_resource_limit_help_corrects_the_two_wrong_intuitions() -> None:
     assert "gradient checkpointing does not lower it" in text  # the obvious-but-wrong fix
     assert "max_seq_length" in text and "2500" in text  # names the lever AND its current value
     assert "batch_size" in text and "2" in text
+
+
+# --- mx.compile is per-shape, which is fatal for unrolled recurrences --------
+
+
+def test_compile_step_defaults_to_auto() -> None:
+    """``None`` means "compile unless it is known to break", not "off"."""
+    import inspect
+
+    from auto_chasm.trainers.base import JointTrainer
+    from auto_chasm.trainers.trainer import Trainer
+
+    for cls in (Trainer, JointTrainer):
+        assert inspect.signature(cls.__init__).parameters["compile_step"].default is None
+
+
+def test_trainer_forwards_compile_step_to_every_joint_trainer() -> None:
+    """Both construction sites must forward it, or the MLX path silently recompiles.
+
+    ``_train_mlx`` uses the SECOND site; patching only the first left the real
+    training path compiled and the bug alive.
+    """
+    import inspect
+
+    from auto_chasm.trainers.trainer import Trainer
+
+    src = inspect.getsource(Trainer)
+    assert src.count("compile_step=self.compile_step") == src.count("JointTrainer(")
+
+
+def test_base_disables_compile_for_unrolled_recurrences() -> None:
+    """The auto-disable must key on the detector, not on a model name."""
+    import inspect
+
+    from auto_chasm.trainers.base import JointTrainer
+
+    src = inspect.getsource(JointTrainer.run)
+    assert "unrolled_recurrence_layers" in src
+    assert "compile_step = False" in src

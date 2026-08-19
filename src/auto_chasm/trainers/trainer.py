@@ -64,6 +64,11 @@ class Trainer:
             Defaults to ``save_steps`` if ``None``.
         early_stopping_patience: Stop after N eval rounds without improvement.
             0 (the default) disables early stopping.
+        compile_step: Whether to ``mx.compile`` the training step (MLX).
+            ``None`` (default) compiles EXCEPT on models that unroll a
+            per-timestep recurrence, where one compiled graph per input shape
+            exhausts Metal's buffer limit a few hundred iterations in. ``True``
+            forces compilation, ``False`` disables it.
         restore_best_weights: If ``True``, reload the best-scoring checkpoint at
             the end of ``train()``. Default ``False`` — the FINAL-step weights
             are what you get, which is what a fixed-budget run almost always
@@ -112,6 +117,7 @@ class Trainer:
         eval_steps: int | None = _UNSET,
         early_stopping_patience: int = 0,
         restore_best_weights: bool = False,
+        compile_step: bool | None = None,
         early_stopping_metric: str = "val_loss",
         early_stopping_higher_is_better: bool = False,
         min_delta: float = 1e-4,
@@ -153,6 +159,7 @@ class Trainer:
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
         self.restore_best_weights = restore_best_weights
+        self.compile_step = compile_step
         self.early_stopping_metric = early_stopping_metric
         self.early_stopping_higher_is_better = early_stopping_higher_is_better
         self.min_delta = min_delta
@@ -388,6 +395,7 @@ class Trainer:
                 eval_steps=self.eval_steps,
                 early_stopping_patience=self.early_stopping_patience,
                 restore_best_weights=self.restore_best_weights,
+                compile_step=self.compile_step,
                 early_stopping_metric=self.early_stopping_metric,
                 early_stopping_higher_is_better=self.early_stopping_higher_is_better,
                 min_delta=self.min_delta,
@@ -436,6 +444,7 @@ class Trainer:
             eval_steps=self.eval_steps,
             early_stopping_patience=self.early_stopping_patience,
             restore_best_weights=self.restore_best_weights,
+            compile_step=self.compile_step,
             early_stopping_metric=self.early_stopping_metric,
             early_stopping_higher_is_better=self.early_stopping_higher_is_better,
             min_delta=self.min_delta,

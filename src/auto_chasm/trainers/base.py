@@ -117,6 +117,7 @@ class JointTrainer:
         eval_steps: int | None = None,
         early_stopping_patience: int = 0,
         restore_best_weights: bool = False,
+        compile_step: bool | None = None,
         early_stopping_metric: str = "val_loss",
         early_stopping_higher_is_better: bool = False,
         min_delta: float = 1e-4,
@@ -150,6 +151,8 @@ class JointTrainer:
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
         self.restore_best_weights = restore_best_weights
+        # None = auto (compile, except where it is known to break); True/False force.
+        self.compile_step = True if compile_step is None else compile_step
         self.early_stopping_metric = early_stopping_metric
         self.early_stopping_higher_is_better = early_stopping_higher_is_better
         self.min_delta = min_delta
@@ -288,8 +291,7 @@ class JointTrainer:
         grad_accum_steps = self.grad_accum_steps
         state = [model.state, self.optimizer.state, mx.random.state]
 
-        @partial(mx.compile, inputs=state, outputs=state)
-        def step(
+        def _step_impl(
             batch: Any,
             labels: Any,
             lengths: Any,
@@ -309,6 +311,34 @@ class JointTrainer:
                 grad = None
 
             return lvalue, toks, components, grad
+
+        # COMPILE IS PER-SHAPE, AND THAT IS FATAL FOR UNROLLED RECURRENCES.
+        # ``iterate_batches`` pads to a 32-token boundary, so a run sees roughly
+        # max_seq_length/32 distinct shapes and mx.compile builds (and retains) one
+        # graph per shape. For a dense model those graphs are small. For a model
+        # whose linear-attention blocks unroll a loop over every timestep, each one
+        # is ~T x n_blocks nodes, and the RETAINED SET crosses Metal's 499000-buffer
+        # ceiling a few hundred iterations in -- long after any short smoke test
+        # passes, and with tens of GB still free. Measured on Qwen3.5-0.8B (18 such
+        # blocks, max_seq_length=1280, ~40 shapes): dies at iteration ~170 compiled,
+        # completes uncompiled. A single large graph is NOT the problem -- one
+        # 4096-token step compiles and runs fine.
+        compile_step = self.compile_step
+        if compile_step:
+            from auto_chasm import _grad_checkpoint as _gc
+
+            if _gc.unrolled_recurrence_layers(self.wrapper.model) > 0:
+                compile_step = False
+                self._log(
+                    "  [compile] disabled: this model unrolls a per-timestep recurrence, "
+                    "so one compiled graph per input shape exhausts the Metal buffer "
+                    "limit mid-run. Set compile_step=True explicitly to override."
+                )
+        step = (
+            partial(mx.compile, inputs=state, outputs=state)(_step_impl)
+            if compile_step
+            else _step_impl
+        )
 
         model.train()
         self.output_dir.mkdir(parents=True, exist_ok=True)
