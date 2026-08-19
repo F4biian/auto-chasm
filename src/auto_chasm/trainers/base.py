@@ -364,9 +364,22 @@ class JointTrainer:
             lengths = mx.array(lengths)
             # Flush the last partial accumulation group on the final iteration (torch parity).
             do_update = (it % grad_accum_steps == 0) or (it == self.num_iters)
-            lvalue, toks, components, grad_accum = step(
-                tokens, labels, lengths, grad_accum, do_update
-            )
+            try:
+                lvalue, toks, components, grad_accum = step(
+                    tokens, labels, lengths, grad_accum, do_update
+                )
+            except RuntimeError as exc:
+                # Metal's buffer-COUNT ceiling reads like an OOM and is not one;
+                # re-raise with what actually reduces it.
+                from auto_chasm import _grad_checkpoint as _gc
+
+                if not _gc.is_resource_limit_error(exc):
+                    raise
+                raise RuntimeError(
+                    _gc.resource_limit_help(
+                        self.wrapper.model, self.batch_size, self.max_seq_length
+                    )
+                ) from exc
 
             should_eval = (
                 val_data is not None

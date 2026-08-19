@@ -509,8 +509,13 @@ differentiable path is an unrolled loop over timesteps — in mlx-lm,
 before counting the other per-step intermediates.
 
 The same unrolled loop multiplies the number of distinct buffers in one graph,
-which is what surfaces as `[metal::malloc] Resource limit (499000) exceeded` at
-longer sequences or higher `grad_accum_steps`.
+which is what surfaces as `[metal::malloc] Resource limit (499000) exceeded`.
+That one is a **count** limit, not memory — free RAM does not prevent it, and
+gradient checkpointing does **not** lower it (checkpointing recomputes, so the op
+count stays). Only a smaller graph helps: lower `max_seq_length` first (the count
+is roughly linear in it), then `batch_size`. The trainer catches this error and
+re-raises it with those levers and their current values, rather than letting the
+raw `metal::malloc` message through.
 
 The trainer detects such blocks and prints a `[memory]` line naming the cause
 before the first step, rather than letting the run die unexplained. The PyTorch

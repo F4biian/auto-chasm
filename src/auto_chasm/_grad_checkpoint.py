@@ -226,3 +226,45 @@ def memory_warning(model: Any) -> str | None:
         f"max_seq_length and batch_size=1 also help; grad_accum_steps does NOT (measured: "
         f"+0.6 GB from 1 to 4), but high values can trip the Metal buffer-count limit."
     )
+
+
+#: Substring identifying Metal's per-graph resource-COUNT ceiling. It is not a
+#: memory limit: it caps how many distinct buffers one evaluation may reference.
+_RESOURCE_LIMIT_MARKER = "Resource limit"
+
+
+def is_resource_limit_error(exc: BaseException) -> bool:
+    """True for Metal's buffer-count ceiling (``[metal::malloc] Resource limit``)."""
+    return _RESOURCE_LIMIT_MARKER in str(exc)
+
+
+def resource_limit_help(model: Any, batch_size: int, max_seq_length: int) -> str:
+    """Actionable text for a Metal buffer-count failure.
+
+    Raised as ``[metal::malloc] Resource limit (499000) exceeded``, which reads
+    like an out-of-memory error and is not one -- 499000 is a COUNT of distinct
+    buffers in a single graph, and the machine may have tens of GB free when it
+    fires. Gradient checkpointing does NOT help: it lowers retained memory but
+    recomputes the forward, so the op count stays as high or higher.
+
+    An unrolled per-timestep recurrence is the usual way to reach it: each
+    timestep of each such block contributes its own ops, so the count grows with
+    sequence length x number of those blocks.
+    """
+    n = unrolled_recurrence_layers(model)
+    cause = (
+        f"{n} linear-attention block(s) unroll a loop over every timestep during "
+        f"training, so the graph's op count grows with sequence length x {n}. "
+        if n
+        else ""
+    )
+    return (
+        f"Metal buffer-count limit hit during the backward pass. {cause}"
+        f"This is a COUNT limit, not memory -- free RAM does not prevent it, and "
+        f"gradient checkpointing does not lower it (it recomputes, so the count stays). "
+        f"Reduce the graph instead, in this order: lower max_seq_length "
+        f"(currently {max_seq_length}; the count is roughly linear in it), then "
+        f"batch_size (currently {batch_size}). Lowering grad_accum_steps also helps "
+        f"when several micro-batches land in one evaluation. Measured on "
+        f"Qwen3.5-0.8B: ~1200 tokens at batch_size=1 is under the limit."
+    )

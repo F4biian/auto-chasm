@@ -127,3 +127,22 @@ def test_torch_target_rejects_a_plain_module() -> None:
 
     with pytest.raises(RuntimeError, match="does not expose gradient_checkpointing_enable"):
         gc._torch_target(nn.Linear(2, 2))
+
+
+# --- Metal buffer-count ceiling --------------------------------------------
+
+
+def test_resource_limit_is_recognised() -> None:
+    assert gc.is_resource_limit_error(
+        RuntimeError("[metal::malloc] Resource limit (499000) exceeded.")
+    )
+    assert not gc.is_resource_limit_error(RuntimeError("something else entirely"))
+
+
+def test_resource_limit_help_corrects_the_two_wrong_intuitions() -> None:
+    """The message must kill the two things users try first, both of which fail."""
+    text = gc.resource_limit_help(_model([_Block()] * 3), batch_size=2, max_seq_length=2500)
+    assert "not memory" in text  # it reads like OOM; free RAM does not help
+    assert "gradient checkpointing does not lower it" in text  # the obvious-but-wrong fix
+    assert "max_seq_length" in text and "2500" in text  # names the lever AND its current value
+    assert "batch_size" in text and "2" in text
