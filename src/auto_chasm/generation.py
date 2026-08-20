@@ -213,7 +213,11 @@ def chat(
         Generated response text.
     """
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        from auto_chasm._chat_template import template_kwargs
+
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **template_kwargs(None)
+        )
     else:
         prompt = (
             "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in messages)
@@ -267,8 +271,10 @@ def chat_repl(
         messages.append({"role": "user", "content": user_input})
 
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            from auto_chasm._chat_template import template_kwargs
+
             prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True, **template_kwargs(None)
             )
         else:
             prompt = (

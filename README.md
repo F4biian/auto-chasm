@@ -214,6 +214,45 @@ text's tokens are never divided across train and val. `class_weights` feeds
 automatically (used by [`LayerSweep`](#lora-checkpoints--layer-sweeps)).
 </details>
 
+### Chat templates & reasoning mode
+
+Conversations are rendered through the tokenizer's **chat template**, so training
+sees the same format as inference — role markers, turn delimiters, and any system
+turn the template injects:
+
+```python
+data = Dataset.from_conversations(conversations=convos, tokenizer=model.tokenizer,
+                                  lm_train_on="assistant")
+# tokens decode to:
+# '<|im_start|>user\nWho invented it?<|im_end|>\n<|im_start|>assistant\nIt was ...<|im_end|>\n'
+```
+
+Character spans stay valid: the scaffolding is tokenized separately from the
+content and spliced around it, never rendered into one string. LM weights follow
+the turn structure — a turn's **opener is masked** (it is prompt, not a target)
+while its **closing tag takes the role's weight**, so `lm_train_on="assistant"`
+still teaches the model to emit `<|im_end|>` and stop.
+
+Pass `chat_template=False` to concatenate raw message text instead (the pre-0.3
+behaviour, needed to reproduce datasets built before this existed).
+
+**Reasoning mode.** Set it once; data prep and generation both honour it:
+
+```python
+from auto_chasm import set_default_thinking
+set_default_thinking(False)          # closes the <think> block everywhere
+```
+
+Do not rely on the template's own default. For Qwen3.5 a plain `AutoTokenizer`
+renders a **closed** `<think></think>` (reasoning off) while mlx-lm's
+`TokenizerWrapper` leaves it **open** (reasoning on) — from the identical template
+string. Per-call `enable_thinking=` overrides the global on both
+`Dataset.from_conversations` and `build_dataset`.
+
+If your assistant messages contain no reasoning traces, use `False`: with `True`
+the training turns still render an empty closed block while generation opens one,
+which is the mismatch this setting exists to prevent.
+
 ### Per-token LM-loss weights — mask & unlearn tokens
 
 The reserved label key **`"lm_head"`** controls how each token trains the

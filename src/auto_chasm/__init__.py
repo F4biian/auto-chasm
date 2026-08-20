@@ -14,6 +14,7 @@ Public API::
 """
 
 from auto_chasm import ops
+from auto_chasm._chat_template import set_default_thinking
 from auto_chasm.config import (
     GenerationConfig,
     LoraConfig,
@@ -31,6 +32,7 @@ from auto_chasm.task import Task
 from auto_chasm.trainers import JointLoss, SFTTrainer, Trainer
 
 __all__ = [
+    "set_default_thinking",
     # Model, data, task
     "Model",
     "Dataset",

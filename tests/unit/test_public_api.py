@@ -33,6 +33,9 @@ EXPECTED_PUBLIC = {
     "GenerationConfig",
     "SteeringConfig",
     "LoraConfig",
+    # Reasoning mode is process-wide on purpose: data prep and generation must
+    # agree, and the template's own default differs between tokenizer wrappers.
+    "set_default_thinking",
 }
 
 # Names deliberately DEMOTED from the top level → where they now live.

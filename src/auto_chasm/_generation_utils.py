@@ -45,7 +45,17 @@ def _resolve_prompt(
             raise ValueError(
                 "Tokenizer has no chat_template. Pass a string prompt instead of messages."
             )
-        return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)  # type: ignore[no-any-return]
+        # Same reasoning mode as the training data: a model fine-tuned with the
+        # <think> block CLOSED and then sampled with it OPEN sees a prompt shape
+        # it never trained on.
+        from auto_chasm._chat_template import template_kwargs
+
+        return tok.apply_chat_template(  # type: ignore[no-any-return]
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs(None),
+        )
     if prompt is not None:
         return prompt
     raise ValueError("Either prompt or messages must be provided.")

@@ -223,6 +223,20 @@ def span_labels_to_tokens(
     return _aggregate_span_labels(token_offsets, spans, aggregation, fill)
 
 
+def _encode_plain(tokenizer: Any, text: str) -> list[int]:
+    """Encode ``text`` WITHOUT letting the tokenizer add its own special tokens.
+
+    The chat template already contains every special token the sequence needs; a
+    tokenizer that also prepends BOS would duplicate it.
+    """
+    if not text:
+        return []
+    try:
+        return list(tokenizer.encode(text, add_special_tokens=False))
+    except TypeError:  # wrappers whose encode() takes no kwargs (e.g. mlx-lm)
+        return list(tokenizer.encode(text))
+
+
 def build_dataset(
     conversations: list[list[dict[str, Any]]],
     tokenizer: Any,
@@ -230,6 +244,8 @@ def build_dataset(
     aggregation: str | Callable[..., Any] = "max",
     default_label: float | None = None,
     lm_train_on: str | Sequence[str] = "all",
+    chat_template: bool | None = None,
+    enable_thinking: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Build a training dataset from conversations with span labels.
 
@@ -319,6 +335,17 @@ def build_dataset(
             covers. ``None`` (the default) masks them with :data:`IGNORE_INDEX`
             (``-100``) so only explicitly-marked tokens train; pass ``0`` (or
             any value) to treat unmarked tokens as that class instead.
+        chat_template: Render each turn through the tokenizer's chat template
+            (role markers, turn delimiters), so training matches what the model
+            sees at inference. ``None`` (default) applies it whenever the
+            tokenizer HAS a template; ``False`` concatenates raw message text,
+            which is the pre-0.3 behaviour and is needed to reproduce datasets
+            built before this existed. Character spans stay valid either way: the
+            scaffolding is tokenized separately from the content and masked.
+        enable_thinking: Reasoning mode for templates that support it —
+            ``False`` closes the ``<think>`` block, ``True`` opens it, ``None``
+            keeps the template's own default (which is NOT consistent across
+            tokenizer wrappers, so prefer passing it explicitly).
         lm_train_on: ``"all"`` (default — every token trains the LM head), a
             role name, or a sequence of role names whose tokens train. EVERY
             other role is LM-masked — ``"assistant"`` masks ``system`` as well
@@ -370,6 +397,15 @@ def build_dataset(
     lm_roles = _normalize_lm_train_on(lm_train_on)
     emit_lm = lm_roles is not None or any_lm_specs
 
+    from auto_chasm._chat_template import has_chat_template, message_wrappers
+
+    use_template = has_chat_template(tokenizer) if chat_template is None else chat_template
+    if use_template and not has_chat_template(tokenizer):
+        raise ValueError(
+            "chat_template=True but this tokenizer has no chat_template. Pass "
+            "chat_template=False, or use a tokenizer that defines one."
+        )
+
     for conversation in conversations:
         all_tokens: list[int] = []
         # Tokenize each message once; remember offsets + spans so every probe's
@@ -377,18 +413,45 @@ def build_dataset(
         msg_infos: list[tuple[list[int], list[tuple[int, int]], dict[str, Any]]] = []
         conv_probes: set[str] = set()
         lm_weights: list[float] = []
-        for msg in conversation:
+        wrappers: list[tuple[str, str]] = (
+            message_wrappers(tokenizer, list(conversation), enable_thinking=enable_thinking)[0]
+            if use_template
+            else [("", "")] * len(conversation)
+        )
+        for msg, (prefix, suffix) in zip(conversation, wrappers, strict=True):
             token_ids, token_offsets = _encode_with_offsets(msg["content"], tokenizer)
             msg_tokens = token_ids if token_ids is not None else tokenizer.encode(msg["content"])
             msg_labels_dict = msg.get("labels", {})
+            baseline = 1.0 if lm_roles is None or msg.get("role") in lm_roles else 0.0
+
+            # Scaffolding rides along as label-less pseudo-messages, so every probe
+            # array masks it automatically and the content keeps its own offsets.
+            pre_tokens = _encode_plain(tokenizer, prefix)
+            if pre_tokens:
+                all_tokens.extend(pre_tokens)
+                msg_infos.append((pre_tokens, [], {}))
+                if emit_lm:
+                    # A turn OPENER is prompt, never a target: even for a role that
+                    # trains, the model is GIVEN it rather than writing it.
+                    lm_weights.extend([0.0] * len(pre_tokens))
+
             all_tokens.extend(msg_tokens)
             msg_infos.append((msg_tokens, token_offsets, msg_labels_dict))
             conv_probes.update(
                 name for name, spans in msg_labels_dict.items() if spans and name != LM_HEAD
             )
             if emit_lm:
-                baseline = 1.0 if lm_roles is None or msg.get("role") in lm_roles else 0.0
                 lm_weights.extend(_lm_weights_for_message(msg, msg_tokens, token_offsets, baseline))
+
+            post_tokens = _encode_plain(tokenizer, suffix)
+            if post_tokens:
+                all_tokens.extend(post_tokens)
+                msg_infos.append((post_tokens, [], {}))
+                if emit_lm:
+                    # The CLOSING tag takes the role's own weight: with
+                    # lm_train_on="assistant" the model must learn to emit
+                    # <|im_end|> and stop, or generation runs to max_tokens.
+                    lm_weights.extend([baseline] * len(post_tokens))
 
         if emit_lm and lm_roles is not None and all_tokens and not any(lm_weights):
             logger.warning(

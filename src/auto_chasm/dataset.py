@@ -188,6 +188,8 @@ class Dataset:
         default_label: float | None = None,
         groups: Sequence[Any] | None = None,
         lm_train_on: str | Sequence[str] = "all",
+        chat_template: bool | None = None,
+        enable_thinking: bool | None = None,
     ) -> Dataset:
         """Build from span-annotated conversations (thin wrapper over build_dataset).
 
@@ -201,6 +203,12 @@ class Dataset:
                 as ``"group"`` so ``split(groups="group")`` keeps a shared prompt
                 on one side (e.g. the prompt id when one prompt has several
                 answers). Length must equal the number of built samples.
+            chat_template: Apply the tokenizer's chat template (role markers,
+                turn delimiters) so training matches inference. ``None``
+                (default) applies it when the tokenizer has one; ``False``
+                concatenates raw message text (pre-0.3 behaviour).
+            enable_thinking: Reasoning mode for templates that support it;
+                ``None`` keeps the template default, which varies by wrapper.
             lm_train_on: ``"all"`` (default — every token trains the LM head),
                 or the role(s) whose tokens train it — e.g. ``"assistant"`` for
                 the chat-SFT convention. EVERY other role is LM-masked
@@ -220,6 +228,8 @@ class Dataset:
             aggregation,
             default_label,
             lm_train_on=lm_train_on,
+            chat_template=chat_template,
+            enable_thinking=enable_thinking,
         )
         if groups is not None:
             _stamp_groups(samples, groups)
