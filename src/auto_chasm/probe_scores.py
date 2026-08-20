@@ -51,12 +51,21 @@ class ProbeScores:
         """Number of scored tokens."""
         return int(self.labels.shape[0])
 
+    def statistic(self, name: str, fn: Any = None) -> float:
+        """Corpus value of ``fn`` (default AUROC) for one probe.
+
+        Args:
+            name: Probe name.
+            fn: ``(scores, labels) -> float``. ``None`` uses AUROC.
+
+        Returns:
+            The statistic over every scored token.
+        """
+        return float(_resolve_statistic(fn)(self.scores[name], self.labels))
+
     def auroc(self, name: str) -> float:
         """Corpus AUROC for one probe (``nan`` if only one class is present)."""
-        from auto_chasm.metrics import auroc as _auroc
-
-        ones = np.ones_like(self.labels, dtype=bool)
-        return float(_auroc(self.scores[name], self.labels, ones))
+        return self.statistic(name)
 
     def aurocs(self) -> dict[str, float]:
         """Corpus AUROC for every probe."""
@@ -70,6 +79,8 @@ class ProbeScores:
         ci: float = 95.0,
         seed: int = 0,
         cluster: bool = True,
+        method: str = "percentile",
+        statistic: Any = None,
     ) -> dict[str, tuple[float, float, float]]:
         """Bootstrap a confidence interval per probe, on SHARED resamples.
 
@@ -86,12 +97,23 @@ class ProbeScores:
             cluster: Resample whole GROUPS (correct). ``False`` resamples tokens
                 independently, which is wrong for token-level data and only
                 exists so the difference can be demonstrated.
+            method: ``"percentile"`` (default) takes the empirical quantiles of
+                the draws. ``"basic"`` (reverse percentile) reflects them through
+                the point estimate, ``[2t - q_hi, 2t - q_lo]``, which corrects
+                first-order bias when the draws sit systematically off the point
+                estimate — worth checking when an interval looks lopsided.
+            statistic: ``(scores, labels) -> float`` to bootstrap. ``None`` uses
+                AUROC; pass your own for accuracy, F1, or anything else.
 
         Returns:
             ``{probe_name: (point_estimate, lo, hi)}``.
-        """
-        from auto_chasm.metrics import auroc as _auroc
 
+        Raises:
+            ValueError: On an unknown ``method``.
+        """
+        if method not in ("percentile", "basic"):
+            raise ValueError(f"method must be 'percentile' or 'basic', got {method!r}.")
+        stat = _resolve_statistic(statistic)
         names = list(self.scores) if name is None else [name]
         rng = np.random.default_rng(seed)
         uniq = np.unique(self.groups)
@@ -110,27 +132,35 @@ class ProbeScores:
             y = self.labels[idx]
             if y.min() == y.max():  # single-class resample: AUROC undefined
                 continue
-            ones = np.ones_like(y, dtype=bool)
             for n in names:
-                draws[n].append(_auroc(self.scores[n][idx], y, ones))
+                draws[n].append(stat(self.scores[n][idx], y))
 
         lo_q, hi_q = (100.0 - ci) / 2.0, 100.0 - (100.0 - ci) / 2.0
         out: dict[str, tuple[float, float, float]] = {}
         for n in names:
             vals = np.asarray(draws[n], dtype=float)
             vals = vals[~np.isnan(vals)]
+            point = self.statistic(n, statistic)
             if vals.size == 0:
-                out[n] = (self.auroc(n), float("nan"), float("nan"))
+                out[n] = (point, float("nan"), float("nan"))
                 continue
-            out[n] = (self.auroc(n), float(np.percentile(vals, lo_q)),
-                      float(np.percentile(vals, hi_q)))
+            lo, hi = float(np.percentile(vals, lo_q)), float(np.percentile(vals, hi_q))
+            if method == "basic":
+                lo, hi = 2.0 * point - hi, 2.0 * point - lo
+            out[n] = (point, lo, hi)
         return out
 
-    def to_csv(self, path: str, *, n_boot: int = 1000, ci: float = 95.0, seed: int = 0) -> None:
-        """Write ``probe,auroc,ci_lo,ci_hi,n_tokens,n_groups`` — ready to plot."""
+    def to_csv(self, path: str, **bootstrap_kwargs: Any) -> None:
+        """Write ``probe,auroc,ci_lo,ci_hi,n_tokens,n_groups`` — ready to plot.
+
+        Args:
+            path: Destination CSV.
+            **bootstrap_kwargs: Forwarded to :meth:`bootstrap` (``n_boot``,
+                ``ci``, ``seed``, ``cluster``, ``method``, ``statistic``).
+        """
         import csv
 
-        stats = self.bootstrap(n_boot=n_boot, ci=ci, seed=seed)
+        stats = self.bootstrap(**bootstrap_kwargs)
         with open(path, "w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["probe", "auroc", "ci_lo", "ci_hi", "n_tokens", "n_groups"])
@@ -139,6 +169,18 @@ class ProbeScores:
                 writer.writerow(
                     [n, point, lo, hi, len(self), int(np.unique(self.groups).size)]
                 )
+
+
+def _resolve_statistic(fn: Any) -> Any:
+    """``fn`` or the default AUROC, as a ``(scores, labels) -> float`` callable."""
+    if fn is not None:
+        return fn
+    from auto_chasm.metrics import auroc as _auroc
+
+    def _default(scores: np.ndarray, labels: np.ndarray) -> float:
+        return float(_auroc(scores, labels, np.ones_like(labels, dtype=bool)))
+
+    return _default
 
 
 def _labels_for(raw_labels: Any, name: str) -> np.ndarray:

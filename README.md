@@ -886,6 +886,42 @@ Every probe is bootstrapped on the **same** resampled draws, so adjacent layers
 share their sampling noise and the curves are comparable — bootstrapping each
 independently makes every layer wobble on its own and hides whether a peak is real.
 
+<details>
+<summary>All bootstrap options</summary>
+
+```python
+ps.bootstrap(
+    name=None,              # one probe, or None for all
+    n_boot=1000,            # resamples
+    ci=95.0,                # central interval width, percent
+    seed=0,                 # reproducible resampling
+    cluster=True,           # resample GROUPS (correct); False resamples tokens
+    method="percentile",    # or "basic" (reverse percentile)
+    statistic=None,         # (scores, labels) -> float; None = AUROC
+)
+```
+
+`method="basic"` reflects the draws through the point estimate,
+`[2t - q_hi, 2t - q_lo]`, correcting first-order bias when the draws sit
+systematically off it — worth checking when an interval looks lopsided.
+
+`statistic=` bootstraps anything, not just AUROC:
+
+```python
+def accuracy(scores, labels):
+    return float(((scores > 0) == labels).mean())
+
+ps.bootstrap(statistic=accuracy)
+```
+
+`ps.to_csv(path, **kwargs)` forwards all of these, and `ps.statistic(name, fn)`
+gives the corpus value of any `fn` without bootstrapping.
+
+`collect_probe_scores` / `model.probe_scores` take `probe_names=` (a subset),
+`batch_size=` and `max_seq_length=`. The result is invariant to `batch_size` —
+padding changes, the masked output does not.
+</details>
+
 The point estimate is the **corpus** AUROC, not the token-weighted mean of
 per-batch AUROCs an eval loop reports. Close, but only the corpus value is the
 thing a confidence interval is around.

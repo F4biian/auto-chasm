@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -114,3 +115,119 @@ def test_no_probes_attached_is_a_clear_error() -> None:
 
     with pytest.raises(ValueError, match="No probes attached"):
         collect_probe_scores(_M(), [])
+
+
+# --- bootstrap knobs --------------------------------------------------------
+
+
+def test_method_basic_reflects_through_the_point_estimate() -> None:
+    ps = _correlated(n_groups=60)
+    pt, plo, phi = ps.bootstrap("p", n_boot=200, seed=0, method="percentile")["p"]
+    _, blo, bhi = ps.bootstrap("p", n_boot=200, seed=0, method="basic")["p"]
+    assert blo == pytest.approx(2 * pt - phi)
+    assert bhi == pytest.approx(2 * pt - plo)
+
+
+def test_unknown_method_raises() -> None:
+    with pytest.raises(ValueError, match="method must be"):
+        _correlated(n_groups=10).bootstrap("p", n_boot=5, method="bca")
+
+
+def test_custom_statistic_is_bootstrapped() -> None:
+    """Anything (accuracy, F1, ...) — not just AUROC."""
+    ps = _correlated(n_groups=60)
+
+    def base_rate(scores: np.ndarray, labels: np.ndarray) -> float:
+        return float(labels.mean())
+
+    pt, lo, hi = ps.bootstrap("p", n_boot=200, seed=0, statistic=base_rate)["p"]
+    assert pt == pytest.approx(ps.labels.mean())
+    assert lo <= pt <= hi
+
+
+def test_to_csv_forwards_bootstrap_kwargs() -> None:
+    ps = _correlated(n_groups=30)
+    path = Path(tempfile.mkdtemp()) / "c.csv"
+    ps.to_csv(str(path), n_boot=40, ci=50.0, seed=3, method="basic")
+    row = next(iter(csv.DictReader(path.open())))
+    assert float(row["ci_lo"]) <= float(row["auroc"]) <= float(row["ci_hi"])
+
+
+# --- collect_probe_scores: the extraction itself ----------------------------
+
+
+@pytest.fixture(scope="module")
+def tiny_scored() -> Any:
+    """A real model, a real dataset, real captured states."""
+    from auto_chasm import Dataset, Model, ProbeConfig
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    convos, gids = [], []
+    for p in range(6):
+        for r in range(2):
+            dirty = (p + r) % 2 == 0
+            text = "It was Nikola Tesla." if dirty else "It was Bell."
+            spans = [{"start": 7, "end": 19, "label": 1}] if dirty else []
+            convos.append([{"role": "user", "content": f"Who invented {p}?"},
+                           {"role": "assistant", "content": text,
+                            "labels": {"halluc": spans}}])
+            gids.append(p)
+    d = Dataset.from_conversations(conversations=convos, tokenizer=m.tokenizer,
+                                   default_label=0, groups=gids)
+    m.add_probes([ProbeConfig(name=f"L{i}", layers=[i], module_config={"out_features": 1})
+                  for i in (2, 5)])
+    return m, d, m.probe_scores(d, batch_size=3, max_seq_length=128)
+
+
+def test_extraction_scores_every_labeled_token_once(tiny_scored: Any) -> None:
+    """N must equal the number of non-masked labels in the dataset — no drops, no dupes."""
+    import numpy as np
+
+    _, d, ps = tiny_scored
+    expected = sum(int((np.asarray(s["labels"]) != -100).sum()) for s in d)
+    assert len(ps) == expected
+
+
+def test_extraction_aligns_scores_labels_and_groups(tiny_scored: Any) -> None:
+    _, _, ps = tiny_scored
+    for arr in (*ps.scores.values(), ps.labels, ps.groups):
+        assert arr.shape[0] == len(ps)
+
+
+def test_extraction_keeps_both_classes(tiny_scored: Any) -> None:
+    _, _, ps = tiny_scored
+    assert set(np.unique(ps.labels)) == {0, 1}
+
+
+def test_extraction_uses_the_dataset_group_field(tiny_scored: Any) -> None:
+    """Group ids must be the PROMPT ids passed to from_conversations, not row numbers."""
+    _, _, ps = tiny_scored
+    assert set(np.unique(ps.groups)) == set(range(6))
+
+
+def test_every_attached_probe_is_scored_from_one_pass(tiny_scored: Any) -> None:
+    _, _, ps = tiny_scored
+    assert sorted(ps.scores) == ["L2", "L5"]
+    # different layers must give DIFFERENT scores, or capture is reading one layer
+    assert not np.allclose(ps.scores["L2"], ps.scores["L5"])
+
+
+def test_probe_names_selects_a_subset(tiny_scored: Any) -> None:
+    m, d, _ = tiny_scored
+    ps = m.probe_scores(d, probe_names=["L5"], batch_size=3, max_seq_length=128)
+    assert sorted(ps.scores) == ["L5"]
+
+
+def test_scoring_is_reproducible(tiny_scored: Any) -> None:
+    m, d, ps = tiny_scored
+    again = m.probe_scores(d, batch_size=3, max_seq_length=128)
+    assert np.allclose(ps.scores["L2"], again.scores["L2"])
+    assert np.array_equal(ps.labels, again.labels)
+
+
+def test_batch_size_does_not_change_the_result(tiny_scored: Any) -> None:
+    """Padding differs between batch shapes; the masked output must not."""
+    m, d, ps = tiny_scored
+    other = m.probe_scores(d, batch_size=1, max_seq_length=128)
+    assert np.allclose(np.sort(ps.scores["L2"]), np.sort(other.scores["L2"]), atol=1e-4)
+    assert ps.labels.sum() == other.labels.sum()
