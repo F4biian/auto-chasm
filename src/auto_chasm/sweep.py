@@ -378,7 +378,7 @@ class LayerSweep:
         self,
         train_data: DatasetLike,
         val_data: DatasetLike,
-        test_data: DatasetLike,
+        test_data: DatasetLike | None = None,
         *,
         loss_fn: LossFn,
         num_iters: int,
@@ -390,7 +390,11 @@ class LayerSweep:
         Args:
             train_data: Training dataset.
             val_data: Validation dataset (drives per-layer checkpoint selection).
-            test_data: Test dataset (evaluated once on the restored best heads).
+            test_data: Test dataset, evaluated once on the restored best heads.
+                ``None`` SKIPS that pass and leaves the ``test_*`` columns empty —
+                use it when the test numbers come from ``model.probe_scores``
+                instead, which needs its own pass anyway and additionally yields
+                confidence intervals. Scoring the same set twice is pure waste.
             loss_fn: The loss (e.g. pure-probe ``JointLoss(weights={"lm_head": 0.0})``,
                 or ``JointLoss(weights={"lm_head": 0.0}, losses={"<probe>": "ce"})``).
             num_iters: Total training iterations.
@@ -448,7 +452,9 @@ class LayerSweep:
         trainer.train(train_data)
 
         callback.restore_best()
-        test_metrics = trainer.evaluate(test_data)
+        # Skipping this saves a FULL pass over the test set. The heads are already
+        # restored, so model.probe_scores(test_data) reads exactly these weights.
+        test_metrics: dict[str, float] = {} if test_data is None else trainer.evaluate(test_data)
 
         best: dict[int, dict[str, float]] = {}
         for i, name in zip(self.layers, names, strict=True):
@@ -458,7 +464,7 @@ class LayerSweep:
                 "iter": float(record.get("iter", 0)),
                 # The step this layer plateaued at (nan = still improving at the end).
                 "stopped_at": float(callback.stopped.get(name, float("nan"))),
-                "test_loss": _layer_loss(test_metrics, name),
+                "test_loss": _layer_loss(test_metrics, name) if test_metrics else float("nan"),
                 "test_acc": test_metrics.get(f"{name}_acc", float("nan")),
                 "test_adj": test_metrics.get(f"{name}_adj", float("nan")),
             }

@@ -845,7 +845,7 @@ Pass a `task=` (which derives head width, classes, and metrics) *or* `out_featur
 explicitly. `layers=None` sweeps every layer. `score_metric` picks each layer's best
 snapshot — `"val_loss"` (default), `"val_acc"`, `"val_macro_f1"`, … — paired with
 `higher_is_better` (set `True` for accuracy/F1). An unknown metric raises with the
-available names listed. `run(train, val, test, *, loss_fn, num_iters, eval_every)`.
+available names listed. `run(train, val, test=None, *, loss_fn, num_iters, eval_every)`. Pass `test_data=None` to SKIP the internal test pass when the reported numbers come from `model.probe_scores` instead — it needs its own pass anyway and adds confidence intervals, so evaluating the same set twice is wasted work.
 
 A binary `task=` also yields `"val_auroc"` — threshold-free, and invariant to the
 head's scale and bias. Remaining `run(...)` keywords are forwarded to `Trainer`,

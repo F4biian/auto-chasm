@@ -297,3 +297,19 @@ def test_to_csv_honours_explicit_options() -> None:
     w_n = float(narrow["ci_hi"]) - float(narrow["ci_lo"])
     w_w = float(wide["ci_hi"]) - float(wide["ci_lo"])
     assert w_w > w_n
+
+
+def test_sweep_test_data_is_optional() -> None:
+    """Scoring the test set inside run() AND again via probe_scores is a wasted pass.
+
+    ``run`` restores each layer's best head either way, so ``probe_scores`` reads
+    exactly those weights — the internal pass buys nothing when the reported test
+    numbers (and their confidence intervals) come from there.
+    """
+    import inspect
+
+    from auto_chasm import LayerSweep
+
+    assert inspect.signature(LayerSweep.run).parameters["test_data"].default is None
+    src = inspect.getsource(LayerSweep.run)
+    assert "{} if test_data is None else trainer.evaluate(test_data)" in src
