@@ -860,6 +860,38 @@ from the metrics actually produced, so a custom `eval_metrics_fn` reaches the fi
 
 ---
 
+## Error bars — per-token scores & clustered bootstrap
+
+An eval loop reports an aggregate and discards the `(score, label)` pairs, so
+there is nothing left to put a confidence interval around. `probe_scores` runs the
+dataset once and keeps them, for **every attached probe from the same forward
+pass**:
+
+```python
+ps = model.probe_scores(test_data)          # after LayerSweep: each layer's BEST head
+ps.aurocs()                                 # {"L0": 0.71, "L1": 0.74, ...} corpus AUROC
+ps.bootstrap()                              # {"L0": (point, lo, hi), ...} 95% CI
+ps.to_csv("ci.csv")                         # probe,auroc,ci_lo,ci_hi,n_tokens,n_groups
+```
+
+**It resamples RESPONSES, not tokens.** Tokens inside one response share a prompt,
+a model, and a hallucination span — they are nowhere near independent. Resampling
+tokens pretends a corpus of ~1200 responses is ~78k independent observations and
+reports intervals several times too narrow (measured on realistic correlated data:
+0.026 wide token-level vs 0.070 clustered — a 2.7x understatement). Build the
+dataset with `groups=` (the prompt id, say) to cluster a level higher still;
+without one, each sample is its own cluster.
+
+Every probe is bootstrapped on the **same** resampled draws, so adjacent layers
+share their sampling noise and the curves are comparable — bootstrapping each
+independently makes every layer wobble on its own and hides whether a peak is real.
+
+The point estimate is the **corpus** AUROC, not the token-weighted mean of
+per-batch AUROCs an eval loop reports. Close, but only the corpus value is the
+thing a confidence interval is around.
+
+---
+
 ## Model stats & backends
 
 Inspect a model's architecture and parameter counts from the facade:

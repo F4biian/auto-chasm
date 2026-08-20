@@ -719,6 +719,39 @@ class Model:
         self._steering_hooks.clear()
         self._probes.clear()
 
+    def probe_scores(
+        self,
+        dataset: Any,
+        *,
+        probe_names: list[str] | None = None,
+        batch_size: int = 8,
+        max_seq_length: int = 1024,
+    ) -> Any:
+        """Per-token scores + labels for every attached probe, from ONE pass.
+
+        What an eval loop throws away: it reports an aggregate and discards the
+        underlying ``(score, label)`` pairs, so nothing is left to put an error bar
+        around. The returned :class:`~auto_chasm.probe_scores.ProbeScores` keeps
+        them, and its ``bootstrap()`` resamples whole RESPONSES (never tokens —
+        tokens inside a response are far from independent, and resampling them
+        gives intervals several times too narrow).
+
+        Args:
+            dataset: The dataset to score.
+            probe_names: Which probes (``None`` = all attached).
+            batch_size: Batch size for the forward passes.
+            max_seq_length: Truncation length, as in training.
+
+        Returns:
+            A ``ProbeScores`` with ``.auroc()``, ``.bootstrap()``, ``.to_csv()``.
+        """
+        from auto_chasm.probe_scores import collect_probe_scores
+
+        return collect_probe_scores(
+            self, dataset, probe_names=probe_names,
+            batch_size=batch_size, max_seq_length=max_seq_length,
+        )
+
     def enable_gradient_checkpointing(self) -> int:
         """Trade ~30% step time for a large cut in activation memory.
 
