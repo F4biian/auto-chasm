@@ -830,8 +830,16 @@ result.to_csv("sweep.csv")      # per-layer metrics; result.plot("sweep.png") dr
 ```python
 LayerSweep(model, *, task=None, out_features=None, module_spec=None, layers=None,
            num_classes=None, score_metric="val_loss", higher_is_better=False,
-           ordinal_tol=1, eval_metrics_fn=None)
+           early_stopping_patience=0, min_delta=0.0, ordinal_tol=1, eval_metrics_fn=None)
 ```
+
+**Early stopping is PER LAYER.** `early_stopping_patience` counts evals without
+improvement for each layer separately, on its own `score_metric`; `min_delta` is the
+margin an improvement must clear so noise around a plateau does not reset the
+counter. A stopped layer keeps the best snapshot it had, and once *every* layer has
+plateaued the run ends — the heads share one forward pass, so no single layer can
+stop the pass on its own. Each layer's plateau step is reported as `stopped_at`
+(`nan` = still improving at the end). `0` (default) disables it.
 
 Pass a `task=` (which derives head width, classes, and metrics) *or* `out_features=`
 explicitly. `layers=None` sweeps every layer. `score_metric` picks each layer's best

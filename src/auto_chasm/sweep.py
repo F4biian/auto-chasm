@@ -100,6 +100,8 @@ class _BestPerLayerCallback(TrainerCallback):
         higher_is_better: bool,
         eval_every: int,
         num_iters: int,
+        patience: int = 0,
+        min_delta: float = 0.0,
     ) -> None:
         """Initialize the per-layer best tracker."""
         self.model = model
@@ -109,8 +111,13 @@ class _BestPerLayerCallback(TrainerCallback):
         self.higher_is_better = higher_is_better
         self.eval_every = eval_every
         self.num_iters = num_iters
+        self.patience = patience
+        self.min_delta = min_delta
         self.trainer: Any = None
         self.best: dict[str, dict[str, Any]] = {}
+        #: evals since this layer last improved, and the step it gave up at.
+        self.stale: dict[str, int] = dict.fromkeys(names, 0)
+        self.stopped: dict[str, int] = {}
 
     def _score(self, metrics: dict[str, float], name: str) -> float:
         """Resolve the scalar this layer is ranked on at the current eval.
@@ -158,19 +165,36 @@ class _BestPerLayerCallback(TrainerCallback):
             return
         metrics = self.trainer.evaluate(self.val_data)
         for name in self.names:
+            if name in self.stopped:
+                continue  # plateaued: its best snapshot is already kept
             score = self._score(metrics, name)
             current = self.best.get(name)
+            # min_delta is a MARGIN, so noise around a plateau does not read as
+            # progress and reset the counter forever.
             improved = current is None or (
-                score > current["score"] if self.higher_is_better else score < current["score"]
+                score > current["score"] + self.min_delta
+                if self.higher_is_better
+                else score < current["score"] - self.min_delta
             )
             if improved:
+                self.stale[name] = 0
                 self.best[name] = {
                     "iter": step,
                     "score": score,
                     "val": self._layer_val(metrics, name),
                     "snapshot": _snapshot(self.model.probes[name].module, self.model.backend.name),
                 }
+            elif self.patience > 0:
+                self.stale[name] += 1
+                if self.stale[name] >= self.patience:
+                    self.stopped[name] = step
         _set_train_mode(self.model, self.trainer)
+
+        if self.patience > 0 and len(self.stopped) == len(self.names) and self.trainer is not None:
+            # Nothing left to learn anywhere: heads share ONE forward pass, so a
+            # layer cannot be stopped on its own -- but once all of them have
+            # plateaued the remaining iterations are pure waste.
+            self.trainer.stop_requested = True
 
     def restore_best(self) -> None:
         """Restore every head to its best-validation snapshot (in place)."""
@@ -303,6 +327,8 @@ class LayerSweep:
         ordinal_tol: int = 1,
         score_metric: str = "val_loss",
         higher_is_better: bool = False,
+        early_stopping_patience: int = 0,
+        min_delta: float = 0.0,
         eval_metrics_fn: Callable[..., dict[str, float]] | None = None,
     ) -> None:
         """Configure the sweep."""
@@ -330,6 +356,8 @@ class LayerSweep:
         self.ordinal_tol = ordinal_tol
         self.score_metric = score_metric
         self.higher_is_better = higher_is_better
+        self.early_stopping_patience = early_stopping_patience
+        self.min_delta = min_delta
         self.eval_metrics_fn = eval_metrics_fn
 
     def _attach_heads(self) -> list[str]:
@@ -388,6 +416,8 @@ class LayerSweep:
             self.higher_is_better,
             eval_every,
             num_iters,
+            self.early_stopping_patience,
+            self.min_delta,
         )
         # These three are OWNED by the sweep: it runs its own per-layer validation
         # and keeps each head at its own best step (see _BestPerLayerCallback), so
@@ -426,6 +456,8 @@ class LayerSweep:
             val = record.get("val", {})
             row = {
                 "iter": float(record.get("iter", 0)),
+                # The step this layer plateaued at (nan = still improving at the end).
+                "stopped_at": float(callback.stopped.get(name, float("nan"))),
                 "test_loss": _layer_loss(test_metrics, name),
                 "test_acc": test_metrics.get(f"{name}_acc", float("nan")),
                 "test_adj": test_metrics.get(f"{name}_adj", float("nan")),

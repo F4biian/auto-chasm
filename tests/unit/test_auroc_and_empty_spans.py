@@ -152,3 +152,43 @@ def test_multi_probe_class_means_run_in_one_pass() -> None:
     assert "_MultiProbeAccumulator" in src
     # the batch loop must be OUTSIDE any per-probe loop
     assert src.index("for raw_tokens") < src.index("for probe_name in probes")
+
+
+# --- per-layer early stopping in LayerSweep ---------------------------------
+
+
+def test_layer_sweep_exposes_early_stopping_params() -> None:
+    import inspect
+
+    from auto_chasm import LayerSweep
+
+    p = inspect.signature(LayerSweep.__init__).parameters
+    assert p["early_stopping_patience"].default == 0     # opt-in
+    assert p["min_delta"].default == 0.0
+
+
+def test_patience_is_tracked_per_layer() -> None:
+    """Each layer stops on ITS OWN metric, not a shared counter."""
+    from auto_chasm.sweep import _BestPerLayerCallback
+
+    cb = _BestPerLayerCallback(None, None, ["L0", "L1"], "val_loss", False, 1, 10,
+                               patience=2, min_delta=0.0)
+    assert cb.stale == {"L0": 0, "L1": 0}
+    assert cb.stopped == {}
+
+
+def test_stop_requested_is_forwarded_to_the_running_loop() -> None:
+    """A callback holds the FACADE; the loop that breaks is the inner trainer.
+
+    Setting the flag on the facade used to be a silent no-op, so every layer could
+    plateau and the run would still burn through num_iters.
+    """
+    import inspect
+
+    from auto_chasm.trainers import _torch_loop
+    from auto_chasm.trainers.base import JointTrainer
+    from auto_chasm.trainers.trainer import Trainer
+
+    assert isinstance(Trainer.stop_requested, property)
+    assert "self.stop_requested" in inspect.getsource(JointTrainer.run)
+    assert 'getattr(trainer, "stop_requested", False)' in inspect.getsource(_torch_loop)

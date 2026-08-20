@@ -419,6 +419,22 @@ class Trainer:
     # MLX path — delegates to JointTrainer
     # ------------------------------------------------------------------
 
+    @property
+    def stop_requested(self) -> bool:
+        """Whether a callback has asked the running loop to finish early.
+
+        Forwards to the live ``JointTrainer``: a callback is handed this facade,
+        but the loop that must actually break lives on the inner trainer, so
+        setting the flag here otherwise did nothing at all.
+        """
+        return bool(getattr(self._joint_trainer, "stop_requested", False))
+
+    @stop_requested.setter
+    def stop_requested(self, value: bool) -> None:
+        """Ask the running loop to stop (ignored when no loop is running)."""
+        if self._joint_trainer is not None:
+            self._joint_trainer.stop_requested = value
+
     def _train_mlx(
         self,
         train_data: Any,

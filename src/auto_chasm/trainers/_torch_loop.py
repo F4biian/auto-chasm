@@ -223,6 +223,14 @@ def train_torch(
                         print(f"Early stopping at step {global_step}. Best was {best_iter}.")
                     break
 
+        # A callback (LayerSweep, once every layer has plateaued) may end the run.
+        # Must be honoured on BOTH backends or per-layer early stopping silently
+        # does nothing on torch.
+        if getattr(trainer, "stop_requested", False):
+            if trainer.verbose:
+                print(f"Stopping at step {global_step}: a callback requested it.")
+            break
+
         # --- Periodic checkpoint ---
         if trainer.save_steps > 0 and global_step % trainer.save_steps == 0:
             path = trainer.output_dir / f"{global_step:07d}_adapters.pt"

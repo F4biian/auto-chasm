@@ -151,6 +151,9 @@ class JointTrainer:
         self.max_seq_length = max_seq_length
         self.early_stopping_patience = early_stopping_patience
         self.restore_best_weights = restore_best_weights
+        # A callback may set this to end the run cleanly (LayerSweep uses it
+        # once every layer has plateaued). Checked after callbacks fire.
+        self.stop_requested = False
         # None = auto (compile, except where it is known to break); True/False force.
         self.compile_step = True if compile_step is None else compile_step
         self.early_stopping_metric = early_stopping_metric
@@ -488,6 +491,10 @@ class JointTrainer:
 
             if step_callback is not None:
                 step_callback(step=it, loss=float(lvalue), components=components)
+
+            if self.stop_requested:
+                self._log(f"Stopping at iter {it}: a callback requested it.")
+                break
 
             eval_args = [state, losses, n_tokens, grad_accum]
             eval_args.extend(component_accum.values())
