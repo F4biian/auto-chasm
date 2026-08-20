@@ -27,6 +27,8 @@ from auto_chasm.steering import SteeringHook, build_auto_steer_fn, validate_stee
 if TYPE_CHECKING:
     import mlx.core as mx
     import torch
+
+    from auto_chasm.probe_scores import ProbeScores
 logger = get_logger(__name__)
 
 
@@ -726,7 +728,7 @@ class Model:
         probe_names: list[str] | None = None,
         batch_size: int = 8,
         max_seq_length: int = 1024,
-    ) -> Any:
+    ) -> ProbeScores:
         """Per-token scores + labels for every attached probe, from ONE pass.
 
         What an eval loop throws away: it reports an aggregate and discards the

@@ -20,14 +20,22 @@ one is what a confidence interval is around.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 
 from auto_chasm.logger import get_logger
 
 logger = get_logger(__name__)
+
+#: "Not supplied" — lets to_csv tell a real argument from a default, so combining
+#: an option with a precomputed ``stats=`` is an error instead of a silent drop.
+_UNSET: Any = object()
+
+#: A bootstrappable statistic: ``(scores, labels) -> float``.
+Statistic: TypeAlias = Callable[[np.ndarray, np.ndarray], float]
 
 
 @dataclass
@@ -51,7 +59,7 @@ class ProbeScores:
         """Number of scored tokens."""
         return int(self.labels.shape[0])
 
-    def statistic(self, name: str, fn: Any = None) -> float:
+    def statistic(self, name: str, fn: Statistic | None = None) -> float:
         """Corpus value of ``fn`` (default AUROC) for one probe.
 
         Args:
@@ -80,7 +88,7 @@ class ProbeScores:
         seed: int = 0,
         cluster: bool = True,
         method: str = "percentile",
-        statistic: Any = None,
+        statistic: Statistic | None = None,
     ) -> dict[str, tuple[float, float, float]]:
         """Bootstrap a confidence interval per probe, on SHARED resamples.
 
@@ -150,28 +158,75 @@ class ProbeScores:
             out[n] = (point, lo, hi)
         return out
 
-    def to_csv(self, path: str, **bootstrap_kwargs: Any) -> None:
+    def to_csv(
+        self,
+        path: str,
+        *,
+        stats: dict[str, tuple[float, float, float]] | None = None,
+        n_boot: int | Any = _UNSET,
+        ci: float | Any = _UNSET,
+        seed: int | Any = _UNSET,
+        cluster: bool | Any = _UNSET,
+        method: str | Any = _UNSET,
+        statistic: Statistic | None | Any = _UNSET,
+    ) -> None:
         """Write ``probe,auroc,ci_lo,ci_hi,n_tokens,n_groups`` — ready to plot.
+
+        The bootstrap options are spelled out rather than forwarded through
+        ``**kwargs`` so an editor can complete them here.
+
+        ``bootstrap`` is a pure function, not a setting: calling it and then
+        calling this with no options silently writes a DIFFERENT interval (the
+        defaults) and discards the one just computed. So either pass the options
+        here, or hand back the dict ``bootstrap`` returned via ``stats``.
 
         Args:
             path: Destination CSV.
-            **bootstrap_kwargs: Forwarded to :meth:`bootstrap` (``n_boot``,
-                ``ci``, ``seed``, ``cluster``, ``method``, ``statistic``).
+            stats: A result from :meth:`bootstrap` to write as-is. Use this when
+                the dict is also needed in memory, so a long run is not paid for
+                twice. Mutually exclusive with the options below.
+            n_boot: Resamples to draw.
+            ci: Central interval width in percent.
+            seed: Seed for the resampling.
+            cluster: Resample whole groups (correct) rather than tokens.
+            method: ``"percentile"`` or ``"basic"``.
+            statistic: ``(scores, labels) -> float``; ``None`` uses AUROC.
+
+        Raises:
+            TypeError: If ``stats`` is combined with any bootstrap option, since
+                the option would be silently ignored.
         """
         import csv
 
-        stats = self.bootstrap(**bootstrap_kwargs)
+        given = {
+            k: v
+            for k, v in (
+                ("n_boot", n_boot), ("ci", ci), ("seed", seed), ("cluster", cluster),
+                ("method", method), ("statistic", statistic),
+            )
+            if v is not _UNSET
+        }
+        if stats is not None and given:
+            raise TypeError(
+                f"Pass either stats= (a precomputed bootstrap result) or {sorted(given)}, "
+                "not both — the options would be silently ignored in favour of stats."
+            )
+        # The sentinel makes ``given`` a heterogeneous dict, which a splat cannot
+        # type; the alternative is duplicating bootstrap's defaults here, where
+        # they would drift. Runtime behaviour is covered by the to_csv tests.
+        stats = self.bootstrap(**given) if stats is None else stats  # type: ignore[arg-type]
+
         with open(path, "w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["probe", "auroc", "ci_lo", "ci_hi", "n_tokens", "n_groups"])
-            for n in self.scores:
+            for n in stats:
                 point, lo, hi = stats[n]
                 writer.writerow(
                     [n, point, lo, hi, len(self), int(np.unique(self.groups).size)]
                 )
 
 
-def _resolve_statistic(fn: Any) -> Any:
+def _resolve_statistic(fn: Statistic | None) -> Statistic:
     """``fn`` or the default AUROC, as a ``(scores, labels) -> float`` callable."""
     if fn is not None:
         return fn

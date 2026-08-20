@@ -231,3 +231,69 @@ def test_batch_size_does_not_change_the_result(tiny_scored: Any) -> None:
     other = m.probe_scores(d, batch_size=1, max_seq_length=128)
     assert np.allclose(np.sort(ps.scores["L2"]), np.sort(other.scores["L2"]), atol=1e-4)
     assert ps.labels.sum() == other.labels.sum()
+
+
+def test_to_csv_accepts_a_precomputed_bootstrap() -> None:
+    """Calling bootstrap() then to_csv() silently wrote the DEFAULT interval.
+
+    bootstrap() is a pure function, not a setting, so its result has to be handed
+    back explicitly — otherwise an expensive 90%/4200-draw run is discarded and
+    the file holds a 95%/1000-draw one instead.
+    """
+    ps = _correlated(n_groups=40)
+    stats = ps.bootstrap(n_boot=60, ci=90.0, seed=5)
+    path = Path(tempfile.mkdtemp()) / "given.csv"
+    ps.to_csv(str(path), stats=stats)
+    row = next(iter(csv.DictReader(path.open())))
+    assert float(row["ci_lo"]) == pytest.approx(stats["p"][1])
+    assert float(row["ci_hi"]) == pytest.approx(stats["p"][2])
+
+
+def test_to_csv_rejects_stats_plus_options() -> None:
+    ps = _correlated(n_groups=20)
+    with pytest.raises(TypeError, match="not both"):
+        ps.to_csv("/tmp/x.csv", stats=ps.bootstrap(n_boot=20), n_boot=999)
+
+
+def test_to_csv_writes_only_the_probes_in_stats() -> None:
+    """bootstrap(name=...) returns one probe; the CSV must not KeyError on the rest."""
+    base = _correlated(n_groups=20)
+    ps = ProbeScores(scores={"a": base.scores["p"], "b": base.scores["p"]},
+                     labels=base.labels, groups=base.groups, probe_names=["a", "b"])
+    path = Path(tempfile.mkdtemp()) / "one.csv"
+    ps.to_csv(str(path), stats=ps.bootstrap("a", n_boot=20))
+    rows = list(csv.DictReader(path.open()))
+    assert [r["probe"] for r in rows] == ["a"]
+
+
+def test_to_csv_options_are_explicit_for_editors() -> None:
+    """``**kwargs`` forwarded the options but gave editors nothing to complete."""
+    import inspect
+
+    params = set(inspect.signature(ProbeScores.to_csv).parameters) - {"self"}
+    assert {"n_boot", "ci", "seed", "cluster", "method", "statistic", "stats"} <= params
+    assert not any(
+        q.kind is inspect.Parameter.VAR_KEYWORD
+        for q in inspect.signature(ProbeScores.to_csv).parameters.values()
+    )
+
+
+def test_probe_scores_return_type_is_concrete() -> None:
+    """Annotated ``Any``, so no editor could complete .bootstrap()/.to_csv()."""
+    import inspect
+
+    from auto_chasm import Model
+
+    assert inspect.signature(Model.probe_scores).return_annotation == "ProbeScores"
+
+
+def test_to_csv_honours_explicit_options() -> None:
+    ps = _correlated(n_groups=30)
+    path = Path(tempfile.mkdtemp()) / "opt.csv"
+    ps.to_csv(str(path), n_boot=50, ci=50.0, seed=1)
+    narrow = next(iter(csv.DictReader(path.open())))
+    ps.to_csv(str(path), n_boot=50, ci=99.0, seed=1)
+    wide = next(iter(csv.DictReader(path.open())))
+    w_n = float(narrow["ci_hi"]) - float(narrow["ci_lo"])
+    w_w = float(wide["ci_hi"]) - float(wide["ci_lo"])
+    assert w_w > w_n

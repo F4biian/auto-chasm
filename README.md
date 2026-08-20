@@ -914,8 +914,20 @@ def accuracy(scores, labels):
 ps.bootstrap(statistic=accuracy)
 ```
 
-`ps.to_csv(path, **kwargs)` forwards all of these, and `ps.statistic(name, fn)`
-gives the corpus value of any `fn` without bootstrapping.
+`ps.to_csv(path, ...)` takes the same options **spelled out**, so an editor
+completes them there too. `bootstrap()` is a pure function, not a setting — calling
+it and then calling `to_csv()` with no options writes the DEFAULT interval and
+discards the one just computed. Either pass the options to `to_csv`, or hand the
+dict back:
+
+```python
+stats = ps.bootstrap(n_boot=4200, ci=90.0, seed=SEED)
+ps.to_csv("ci.csv", stats=stats)          # writes exactly that run
+ps.to_csv("ci.csv", n_boot=4200, ci=90.0, seed=SEED)   # or compute it here
+```
+
+Combining `stats=` with an option raises rather than silently ignoring it.
+`ps.statistic(name, fn)` gives the corpus value of any `fn` without bootstrapping.
 
 `collect_probe_scores` / `model.probe_scores` take `probe_names=` (a subset),
 `batch_size=` and `max_seq_length=`. The result is invariant to `batch_size` —
