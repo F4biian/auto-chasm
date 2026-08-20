@@ -136,12 +136,20 @@ class _BestPerLayerCallback(TrainerCallback):
         return metrics[full]
 
     def _layer_val(self, metrics: dict[str, float], name: str) -> dict[str, float]:
-        """Collect this layer's validation numbers at the current eval."""
-        return {
-            "val_loss": _layer_loss(metrics, name),
-            "val_acc": metrics.get(f"{name}_acc", 0.0),
-            "val_adj": metrics.get(f"{name}_adj", 0.0),
-        }
+        """Collect EVERY validation number this layer produced at the current eval.
+
+        Hardcoding acc/adj meant a custom ``eval_metrics_fn`` could rank layers on
+        its metric (``score_metric="val_auroc"`` resolves fine) yet never see that
+        metric again -- it reached neither the result rows nor the CSV.
+        """
+        out = {"val_loss": _layer_loss(metrics, name)}
+        prefix = f"{name}_"
+        for key, value in metrics.items():
+            if key.startswith(prefix):
+                out[f"val_{key[len(prefix):]}"] = value
+        out.setdefault("val_acc", 0.0)
+        out.setdefault("val_adj", 0.0)
+        return out
 
     def on_step_end(self, **kwargs: Any) -> None:
         """On the eval cadence, evaluate val and snapshot each improved head."""
@@ -187,34 +195,27 @@ class SweepResult:
     model: Model | None = None
 
     def to_csv(self, path: str) -> None:
-        """Write the per-layer rows to ``path`` (layer, iter, val/test acc + group)."""
+        """Write one row per layer, with EVERY metric the run produced.
+
+        Columns are derived from the rows rather than fixed, so a custom
+        ``eval_metrics_fn`` (an AUROC, say) reaches the file. The historical
+        columns keep their names -- ``val_adj``/``test_adj`` are written as
+        ``val_group_acc``/``test_group_acc`` -- so existing readers still work.
+        """
+        alias = {"val_adj": "val_group_acc", "test_adj": "test_group_acc"}
+        lead = ["val_loss", "val_acc", "val_adj", "test_loss", "test_acc", "test_adj"]
+        seen: list[str] = []
+        for row in self.best.values():
+            seen.extend(k for k in row if k not in seen and k != "iter")
+        ordered = [k for k in lead if k in seen] + sorted(k for k in seen if k not in lead)
+
         with open(path, "w", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(
-                [
-                    "layer",
-                    "iter",
-                    "val_loss",
-                    "val_acc",
-                    "val_group_acc",
-                    "test_loss",
-                    "test_acc",
-                    "test_group_acc",
-                ]
-            )
+            writer.writerow(["layer", "iter", *(alias.get(k, k) for k in ordered)])
             for i in sorted(self.best):
                 row = self.best[i]
                 writer.writerow(
-                    [
-                        i,
-                        row["iter"],
-                        row["val_loss"],
-                        row["val_acc"],
-                        row["val_adj"],
-                        row["test_loss"],
-                        row["test_acc"],
-                        row["test_adj"],
-                    ]
+                    [i, row["iter"], *(row.get(k, float("nan")) for k in ordered)]
                 )
 
     def plot(self, path: str, title: str = "Test Performance") -> None:
@@ -388,6 +389,20 @@ class LayerSweep:
             eval_every,
             num_iters,
         )
+        # These three are OWNED by the sweep: it runs its own per-layer validation
+        # and keeps each head at its own best step (see _BestPerLayerCallback), so
+        # the trainer's global eval/save/early-stop would either duplicate that or
+        # stop EVERY layer when one plateaus. Passing them through **trainer_kwargs
+        # used to surface as "got multiple values for keyword argument", which does
+        # not say which argument or why.
+        reserved = {"eval_steps", "save_steps", "early_stopping_patience"} & set(trainer_kwargs)
+        if reserved:
+            raise TypeError(
+                f"LayerSweep.run() manages {sorted(reserved)} itself; remove them from the "
+                "call. Per-layer checkpoint selection replaces them: use eval_every= for the "
+                "validation cadence, and score_metric=/higher_is_better= on LayerSweep(...) "
+                "to choose what each layer's 'best' means."
+            )
         trainer = Trainer(
             model=self.model,
             loss_fn=loss_fn,
@@ -409,13 +424,19 @@ class LayerSweep:
         for i, name in zip(self.layers, names, strict=True):
             record = callback.best.get(name, {})
             val = record.get("val", {})
-            best[i] = {
+            row = {
                 "iter": float(record.get("iter", 0)),
-                "val_loss": val.get("val_loss", float("nan")),
-                "val_acc": val.get("val_acc", float("nan")),
-                "val_adj": val.get("val_adj", float("nan")),
                 "test_loss": _layer_loss(test_metrics, name),
                 "test_acc": test_metrics.get(f"{name}_acc", float("nan")),
                 "test_adj": test_metrics.get(f"{name}_adj", float("nan")),
             }
+            row.update(val)
+            row.setdefault("val_loss", float("nan"))
+            # Every custom test metric too, so eval_metrics_fn output survives to
+            # the CSV rather than stopping at the ranking step.
+            prefix = f"{name}_"
+            for key, value in test_metrics.items():
+                if key.startswith(prefix):
+                    row[f"test_{key[len(prefix):]}"] = value
+            best[i] = row
         return SweepResult(best=best, model=self.model)

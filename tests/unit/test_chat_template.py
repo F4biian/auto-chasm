@@ -102,3 +102,46 @@ def test_explicit_argument_beats_the_global() -> None:
 def test_global_none_leaves_the_template_alone() -> None:
     set_default_thinking(None)
     assert template_kwargs(None) == {}
+
+
+# --- LayerSweep reserves the knobs it manages itself ------------------------
+
+
+def test_layer_sweep_rejects_the_kwargs_it_owns() -> None:
+    """``**trainer_kwargs`` collided as 'got multiple values for keyword argument'.
+
+    That message names no argument and gives no reason, and the three it covers
+    are exactly the ones the sweep replaces with per-layer selection.
+    """
+    import inspect
+
+    from auto_chasm.sweep import LayerSweep
+
+    src = inspect.getsource(LayerSweep.run)
+    assert '"eval_steps", "save_steps", "early_stopping_patience"' in src
+    assert "manages" in src and "eval_every=" in src
+
+
+def test_sweep_csv_carries_custom_metrics() -> None:
+    """A custom eval_metrics_fn's output must reach the file, not stop at ranking.
+
+    Columns used to be hardcoded to acc/adj, so ``score_metric="val_auroc"``
+    could rank layers on a metric that then appeared nowhere in the results.
+    """
+    import csv
+    import tempfile
+    from pathlib import Path
+
+    from auto_chasm.sweep import SweepResult
+
+    best = {
+        3: {"iter": 50.0, "val_loss": 0.4, "val_acc": 0.8, "val_adj": 0.9,
+            "test_loss": 0.5, "test_acc": 0.75, "test_adj": 0.88, "test_auroc": 0.81},
+    }
+    path = Path(tempfile.mkdtemp()) / "sweep.csv"
+    SweepResult(best=best).to_csv(str(path))
+    header, row = list(csv.reader(path.open()))[:2]
+    assert "test_auroc" in header
+    assert row[header.index("test_auroc")] == "0.81"
+    # historical names preserved for existing readers
+    assert "val_group_acc" in header and "test_group_acc" in header
