@@ -133,3 +133,22 @@ def test_multiclass_head_gets_no_auroc(monkeypatch: pytest.MonkeyPatch) -> None:
         None, {"L0": np.zeros((1, 4, 3))}, np.array([[0, 1, 2, 1]]), np.ones((1, 4), dtype=bool)
     )
     assert "L0_auroc" not in out
+
+
+# --- class means: one pass, however many probes -----------------------------
+
+
+def test_multi_probe_class_means_run_in_one_pass() -> None:
+    """Looping probes outside the batch loop re-ran the corpus per probe.
+
+    Every probe captures from the SAME forward, so a 24-layer mass-mean sweep was
+    paying 24 passes for what one pass already produced.
+    """
+    import inspect
+
+    from auto_chasm.class_means import compute_class_means
+
+    src = inspect.getsource(compute_class_means)
+    assert "_MultiProbeAccumulator" in src
+    # the batch loop must be OUTSIDE any per-probe loop
+    assert src.index("for raw_tokens") < src.index("for probe_name in probes")

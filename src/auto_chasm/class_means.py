@@ -39,23 +39,104 @@ def compute_class_means(
     """
     from auto_chasm.trainers.data_utils import iterate_batches
 
+    # ONE pass, however many probes. Every probe captures from the SAME forward,
+    # so looping probes on the outside re-ran the whole corpus per probe -- a
+    # 24-layer mass-mean sweep cost 24 passes to compute what one pass already
+    # produced. The per-probe helpers still exist for a single probe.
     result: dict[str, dict[str, Any]] = {}
+    if len(probes) == 1:
+        (probe_name, probe), = probes.items()
+        fn = _compute_mlx if backend_name == "mlx" else _compute_torch
+        mean_0, mean_1 = fn(
+            model, probe, dataset, probe.hidden_dim, batch_size, max_seq_length, iterate_batches
+        )
+        return {probe_name: {"mean_0": mean_0, "mean_1": mean_1}}
 
-    for probe_name, probe in probes.items():
-        hidden_dim = probe.hidden_dim
-
-        if backend_name == "mlx":
-            mean_0, mean_1 = _compute_mlx(
-                model, probe, dataset, hidden_dim, batch_size, max_seq_length, iterate_batches
-            )
-        else:
-            mean_0, mean_1 = _compute_torch(
-                model, probe, dataset, hidden_dim, batch_size, max_seq_length, iterate_batches
-            )
-
+    accum = _MultiProbeAccumulator(probes, backend_name, model)
+    for raw_tokens, raw_labels, lengths in iterate_batches(
+        dataset, batch_size, max_seq_length, loop=False
+    ):
+        accum.step(raw_tokens, raw_labels, lengths)
+    for probe_name in probes:
+        mean_0, mean_1 = accum.means(probe_name)
         result[probe_name] = {"mean_0": mean_0, "mean_1": mean_1}
-
     return result
+
+
+class _MultiProbeAccumulator:
+    """Token-level per-class sums for EVERY probe, filled from one forward pass."""
+
+    def __init__(self, probes: dict[str, Any], backend_name: str, model: Any) -> None:
+        """Zero the running sums for each probe."""
+        self.probes = probes
+        self.backend = backend_name
+        self.model = model
+        self.sums: dict[str, list[Any]] = {}
+        self.counts: dict[str, list[float]] = {name: [0.0, 0.0] for name in probes}
+        if backend_name == "mlx":
+            import mlx.core as mx
+
+            self.sums = {n: [mx.zeros(p.hidden_dim), mx.zeros(p.hidden_dim)]
+                         for n, p in probes.items()}
+        else:
+            import torch
+
+            dev = next(model.model.parameters()).device
+            self.sums = {n: [torch.zeros(p.hidden_dim, device=dev),
+                             torch.zeros(p.hidden_dim, device=dev)]
+                         for n, p in probes.items()}
+
+    def step(self, raw_tokens: Any, raw_labels: Any, lengths: Any) -> None:
+        """Run one batch and add each probe's masked per-class sums."""
+        for probe in self.probes.values():
+            probe.clear_captured()
+        if self.backend == "mlx":
+            import mlx.core as mx
+
+            tokens = mx.array(raw_tokens)
+            self.model.forward(tokens[:, :-1])
+            for name, probe in self.probes.items():
+                captured = probe.get_captured_states()
+                if not captured:
+                    continue
+                h = captured[0]
+                labels = mx.array(_labels_for_probe(raw_labels, name))
+                b = labels[:, 1:].astype(mx.float32)
+                steps = mx.arange(1, b.shape[1] + 1)
+                lm = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
+                for cls in (0, 1):
+                    m = mx.logical_and(b == cls, lm).astype(mx.float32)
+                    self.sums[name][cls] = self.sums[name][cls] + mx.sum(
+                        h * mx.expand_dims(m, -1), axis=(0, 1)
+                    )
+                    self.counts[name][cls] += float(mx.sum(m))
+                mx.eval(*self.sums[name])
+            return
+        import torch
+
+        dev = next(self.model.model.parameters()).device
+        tokens = torch.from_numpy(raw_tokens).long().to(dev)
+        lengths_t = torch.from_numpy(lengths).to(dev)
+        with torch.no_grad():
+            self.model.forward(tokens[:, :-1])
+        for name, probe in self.probes.items():
+            captured = probe.get_captured_states()
+            if not captured:
+                continue
+            h = captured[0].float()
+            labels = torch.from_numpy(_labels_for_probe(raw_labels, name)).long().to(dev)
+            b = labels[:, 1:].float()
+            steps = torch.arange(1, b.shape[1] + 1, device=dev)
+            lm = (steps >= lengths_t[:, 0:1]) & (steps < lengths_t[:, 1:])
+            for cls in (0, 1):
+                m = ((b == cls) & lm).float()
+                self.sums[name][cls] += (h * m.unsqueeze(-1)).sum(dim=(0, 1))
+                self.counts[name][cls] += float(m.sum().item())
+
+    def means(self, name: str) -> tuple[Any, Any]:
+        """Class means for ``name`` (sums / counts, guarded against empty classes)."""
+        c0, c1 = self.counts[name]
+        return self.sums[name][0] / max(c0, 1e-8), self.sums[name][1] / max(c1, 1e-8)
 
 
 def _labels_for_probe(raw_labels: Any, probe_name: str) -> Any:

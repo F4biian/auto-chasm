@@ -449,6 +449,13 @@ result = trainer.train(train, val_data=val, test_data=test)
 history = result["history"]              # per-step losses, val metrics, best checkpoint
 ```
 
+`training_history.json` holds **one row per step** — validation and throughput are
+reported from different points in an iteration and are merged into the same entry,
+rather than emitting two half-empty rows. Fields that were not measured at a step
+are omitted instead of written as `null`, so a real `null` still means "computed,
+undefined". When `test_data` is given, its metrics are recorded into the final
+row (and the file re-saved) rather than living only in the returned dict.
+
 The loss over `{"lm_head"} ∪ {probe names}` is a weighted sum by default; each term
 picks its own loss:
 
@@ -831,6 +838,16 @@ explicitly. `layers=None` sweeps every layer. `score_metric` picks each layer's 
 snapshot — `"val_loss"` (default), `"val_acc"`, `"val_macro_f1"`, … — paired with
 `higher_is_better` (set `True` for accuracy/F1). An unknown metric raises with the
 available names listed. `run(train, val, test, *, loss_fn, num_iters, eval_every)`.
+
+A binary `task=` also yields `"val_auroc"` — threshold-free, and invariant to the
+head's scale and bias. Remaining `run(...)` keywords are forwarded to `Trainer`,
+**except** `eval_steps` / `save_steps` / `early_stopping_patience`, which the sweep
+owns: it validates on `eval_every` and keeps each layer at its own best step, so a
+global early stop would halt every layer when one plateaued. Passing them raises.
+
+Snapshots are held in memory (never written to disk), restored per layer before the
+test pass, so `to_csv` reports each layer's own best checkpoint. Columns are derived
+from the metrics actually produced, so a custom `eval_metrics_fn` reaches the file.
 </details>
 
 ---
