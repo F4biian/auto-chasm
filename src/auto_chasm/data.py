@@ -267,6 +267,13 @@ def build_dataset(
     ``default_label=0`` (or any value). Then only fully unlabeled messages stay
     masked, and unmarked tokens *inside labeled messages* take ``default_label``.
 
+    **An EMPTY span list declares the probe.** ``{"probe": []}`` means "this probe
+    applies here and nothing is positive", so every token takes ``default_label``;
+    OMITTING the key is what masks the message. Reading ``[]`` as "unlabeled"
+    silently dropped every negative-only example — in a span-annotated corpus,
+    exactly the clean ones, leaving a negative class made only of the text
+    surrounding positives.
+
     **Label encoding:** The ``build_dataset`` function passes span
     label values through unchanged.  What the values mean is
     determined by the probe's loss function:
@@ -388,7 +395,8 @@ def build_dataset(
     for conversation in conversations:
         for msg in conversation:
             global_probes.update(
-                n for n, spans in msg.get("labels", {}).items() if spans and n != LM_HEAD
+                n for n, spans in msg.get("labels", {}).items()
+                if spans is not None and n != LM_HEAD
             )
             any_lm_specs = any_lm_specs or bool(_lm_specs_of(msg))
     multi_probe = len(global_probes) >= 2
@@ -437,8 +445,11 @@ def build_dataset(
 
             all_tokens.extend(msg_tokens)
             msg_infos.append((msg_tokens, token_offsets, msg_labels_dict))
+            # An empty span list still DECLARES the probe (all-negative message),
+            # so it must register here or the probe's array is never built.
             conv_probes.update(
-                name for name, spans in msg_labels_dict.items() if spans and name != LM_HEAD
+                name for name, spans in msg_labels_dict.items()
+                if spans is not None and name != LM_HEAD
             )
             if emit_lm:
                 lm_weights.extend(_lm_weights_for_message(msg, msg_tokens, token_offsets, baseline))
@@ -479,12 +490,22 @@ def build_dataset(
             seq: list[int | float] = []
             for msg_tokens, token_offsets, msg_labels_dict in msg_infos:
                 spans = msg_labels_dict.get(name)
-                if spans and token_offsets:
+                # ABSENT vs EMPTY are different statements about a message:
+                #   name not in labels -> this probe does not apply here -> mask.
+                #   name -> []         -> it DOES apply and nothing is positive,
+                #                         so every token takes ``fill``.
+                # Treating [] as "unlabeled" silently dropped every negative-only
+                # example: in a span-annotated corpus that is precisely the clean
+                # responses, so the negative class collapsed to whatever sat around
+                # the positives, and the model never saw a wholly-clean example.
+                if name not in msg_labels_dict:
+                    lab = [masked] * len(msg_tokens)
+                elif spans and token_offsets:
                     lab = _aggregate_span_labels(token_offsets, spans, aggregation, fill)
                     lab += [masked] * (len(msg_tokens) - len(lab))
                     lab = lab[: len(msg_tokens)]
                 else:
-                    lab = [masked] * len(msg_tokens)
+                    lab = [fill] * len(msg_tokens)
                 seq.extend(lab)
             per_probe[name] = _shift_and_fit(seq, offset, len(all_tokens), masked)
 

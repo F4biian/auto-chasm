@@ -253,6 +253,12 @@ If your assistant messages contain no reasoning traces, use `False`: with `True`
 the training turns still render an empty closed block while generation opens one,
 which is the mismatch this setting exists to prevent.
 
+**Empty span list = all negative.** `labels={"probe": []}` *declares* the probe for
+that message and marks nothing positive, so every token takes `default_label`.
+Omitting the probe key entirely is what masks the message. The distinction matters:
+in a span-annotated corpus the negative-only examples are the clean ones, and
+reading `[]` as "unlabeled" drops them all.
+
 ### Per-token LM-loss weights — mask & unlearn tokens
 
 The reserved label key **`"lm_head"`** controls how each token trains the
@@ -863,7 +869,7 @@ autocomplete the whole API.
 | `JointLoss`, `ops` | the joint LM+probe loss and the backend-agnostic math facade |
 | `LayerSweep`, `SweepResult` | per-layer probing sweeps and their results |
 | `GenerationConfig`, `SteeringConfig`, `LoraConfig` | feature configs |
-| `classification_metrics`, `regression_metrics` | metric helpers |
+| `classification_metrics`, `regression_metrics` | metric helpers (binary heads also get `_auroc`) |
 
 The runnable, backend-free scripts under [`demo/`](demo/) exercise each of these
 end-to-end.

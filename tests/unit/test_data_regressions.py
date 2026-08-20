@@ -265,8 +265,14 @@ class TestBuildDatasetMultiProbe:
         assert labels[1] == 0
         assert labels[2] == 0
 
-    def test_empty_span_probe_does_not_count_as_multi(self) -> None:
-        """A second probe with an EMPTY span list does not trigger the error."""
+    def test_empty_span_probe_is_a_declared_probe(self) -> None:
+        """An EMPTY span list DECLARES the probe (all-negative), so this is multi-probe.
+
+        It used to be read as "unlabeled", which silently dropped every
+        negative-only example -- in a span-annotated corpus, exactly the clean
+        ones. Declaring probe_b therefore now yields per-probe dict labels:
+        probe_a carries its span, probe_b is all-fill.
+        """
         tok = MockEncodeTokenizer()
         conversations = [
             [
@@ -280,8 +286,11 @@ class TestBuildDatasetMultiProbe:
                 }
             ]
         ]
-        result = build_dataset(conversations, tok)
-        assert result[0]["labels"][0] == 1
+        result = build_dataset(conversations, tok, default_label=0)
+        labels = result[0]["labels"]
+        assert set(labels) == {"probe_a", "probe_b"}
+        assert labels["probe_a"][0] == 1
+        assert labels["probe_b"] == [0, 0, 0]
 
     def test_no_labels_still_works(self) -> None:
         """A message with no labels masks all tokens to -100."""

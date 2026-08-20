@@ -294,6 +294,45 @@ def regression_metrics(
     return _fn
 
 
+def auroc(scores: Any, targets: Any, mask: Any) -> float:
+    """Masked, ``-100``-aware AUROC for a binary head, from raw SCORES.
+
+    Rank-based (Mann-Whitney U) with ties averaged, so no sklearn dependency and
+    no threshold: unlike accuracy or F1 it reads the head's continuous output, and
+    it is invariant to any positive rescaling or shift of that output. That is
+    what makes it the right metric for a probe whose direction is frozen and whose
+    scale/bias are free.
+
+    Args:
+        scores: Continuous head output ``[B, T]`` (a logit, not a class index).
+        targets: Binary targets ``[B, T]``; ``-100`` positions are excluded.
+        mask: Boolean validity mask ``[B, T]``.
+
+    Returns:
+        AUROC in ``[0, 1]``, or ``nan`` when the selection holds only one class
+        (undefined then -- the caller should OMIT the key rather than record a
+        number, so the eval loop averages over the batches where it existed).
+    """
+    s = np.asarray(scores, dtype=np.float64).reshape(-1)
+    t = np.asarray(targets).reshape(-1)
+    m = np.asarray(mask).reshape(-1).astype(bool) & (t != -100)
+    s, t = s[m], t[m].astype(np.int64)
+    pos = t == 1
+    n_p, n_n = int(pos.sum()), int((~pos).sum())
+    if n_p == 0 or n_n == 0:
+        return float("nan")
+    order = np.argsort(s, kind="mergesort")
+    ranks = np.empty(len(s), dtype=np.float64)
+    ranks[order] = np.arange(1, len(s) + 1, dtype=np.float64)
+    # Average ranks inside tie groups, or a head that outputs constants would
+    # score 0 or 1 instead of the correct 0.5.
+    _, inv, cnt = np.unique(s, return_inverse=True, return_counts=True)
+    sums = np.zeros(len(cnt), dtype=np.float64)
+    np.add.at(sums, inv, ranks)
+    ranks = (sums / cnt)[inv]
+    return float((ranks[pos].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n))
+
+
 def classification_metrics(
     num_classes: int | None = None,
     ordinal_tol: int = 1,
@@ -347,6 +386,14 @@ def classification_metrics(
             out[f"{name}_acc"] = accuracy(preds, tgt, msk)
             out[f"{name}_adj"] = ordinal_accuracy(preds, tgt, msk, tol=ordinal_tol)
             out[f"{name}_macro_f1"] = macro_f1(preds, tgt, msk, n_cls)
+            if logits.shape[-1] == 1:
+                # Threshold-free, and the metric separability studies report. OMIT
+                # the key on a single-class batch rather than emitting nan: the
+                # eval loop averages each key over the batches where it appeared,
+                # so a nan would poison the whole average.
+                score = auroc(logits[..., 0], tgt, msk)
+                if not np.isnan(score):
+                    out[f"{name}_auroc"] = score
         return out
 
     return _fn
