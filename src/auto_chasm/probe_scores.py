@@ -79,6 +79,38 @@ class ProbeScores:
         """Corpus AUROC for every probe."""
         return {n: self.auroc(n) for n in self.scores}
 
+    def metrics(self, name: str) -> dict[str, float]:
+        """Every headline metric for one probe, from the scores already collected.
+
+        A per-token score plus its label is enough for all of them, so a run does
+        not need a second evaluation pass to report accuracy or F1 alongside
+        AUROC. All are CORPUS values over the whole split.
+
+        Args:
+            name: Probe name.
+
+        Returns:
+            ``{"loss", "acc", "macro_f1", "auroc"}``. ``loss`` is the mean
+            binary cross-entropy of the raw score (so it is comparable to a
+            trained probe's reported loss); ``acc`` and ``macro_f1`` threshold at
+            ``score > 0``, which is where ``fit_mass_mean`` puts the midpoint of
+            the class means.
+        """
+        from auto_chasm.metrics import macro_f1
+
+        s = np.asarray(self.scores[name], dtype=np.float64)
+        y = self.labels.astype(np.int64)
+        ones = np.ones_like(y, dtype=bool)
+        preds = (s > 0.0).astype(np.int64)
+        # Stable BCE-with-logits: log(1+exp(-|s|)) + max(s,0) - s*y
+        loss = float(np.mean(np.log1p(np.exp(-np.abs(s))) + np.maximum(s, 0.0) - s * y))
+        return {
+            "loss": loss,
+            "acc": float((preds == y).mean()),
+            "macro_f1": float(macro_f1(preds, y, ones, 2)),
+            "auroc": self.auroc(name),
+        }
+
     def bootstrap(
         self,
         name: str | None = None,
@@ -506,3 +538,98 @@ def collect_hidden_states(
         groups=np.concatenate(kept_g),
         n_seen=n_seen,
     )
+
+
+@dataclass
+class ProbeReport:
+    """One row per probe, with every metric on every split — the comparable table.
+
+    Attributes:
+        rows: ``{probe_name: {column: value}}``.
+        splits: Split names in the order they were evaluated.
+    """
+
+    rows: dict[str, dict[str, Any]]
+    splits: list[str] = field(default_factory=list)
+
+    def to_csv(self, path: str) -> None:
+        """Write the table; columns are derived from the rows, ``probe`` first."""
+        import csv
+
+        seen: list[str] = []
+        for row in self.rows.values():
+            seen.extend(k for k in row if k not in seen)
+        lead = [c for c in ("layer",) if c in seen]
+        rest = [c for c in seen if c not in lead]
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["probe", *lead, *rest])
+            for name in self.rows:
+                row = self.rows[name]
+                writer.writerow([name, *(row.get(c, "") for c in (*lead, *rest))])
+
+
+def evaluate_probes(
+    model: Any,
+    splits: dict[str, Any],
+    *,
+    probe_names: list[str] | None = None,
+    n_boot: int = 1000,
+    ci: float = 95.0,
+    seed: int = 0,
+    cluster: bool = True,
+    batch_size: int = 8,
+    max_seq_length: int = 1024,
+) -> ProbeReport:
+    """Score every probe on every split and build one comparable per-probe table.
+
+    Works the same for a TRAINED sweep head and a closed-form ``fit_mass_mean``
+    one — both are linear heads by the time they are scored — so a mass-mean run
+    produces the same columns as a gradient-trained run and the two can be plotted
+    together. Training-only facts (which iteration a layer peaked at, where it
+    plateaued) stay in ``SweepResult``, because a closed-form fit has none.
+
+    Args:
+        model: A ``Model`` with probes attached and fitted.
+        splits: ``{"val": val_data, "test": test_data}`` — any names, any number.
+        probe_names: Which probes (``None`` = all attached).
+        n_boot: Bootstrap resamples for the AUROC interval (``0`` skips it).
+        ci: Interval width in percent.
+        seed: Resampling seed.
+        cluster: Resample groups rather than tokens (see :meth:`ProbeScores.bootstrap`).
+        batch_size: Batch size for the forward passes.
+        max_seq_length: Truncation length.
+
+    Returns:
+        A :class:`ProbeReport` with ``{split}_loss/_acc/_macro_f1/_auroc`` per
+        probe, plus ``{split}_auroc_lo/_hi`` when bootstrapping is on.
+    """
+    names = list(probe_names if probe_names is not None else model.probes)
+    rows: dict[str, dict[str, Any]] = {n: {} for n in names}
+
+    for name in names:
+        layers = model.probes[name].layers
+        if len(layers) == 1:
+            rows[name]["layer"] = layers[0]
+
+    for split_name, dataset in splits.items():
+        scores = collect_probe_scores(
+            model, dataset, probe_names=names,
+            batch_size=batch_size, max_seq_length=max_seq_length,
+        )
+        intervals = (
+            scores.bootstrap(n_boot=n_boot, ci=ci, seed=seed, cluster=cluster)
+            if n_boot > 0
+            else {}
+        )
+        for name in names:
+            for metric, value in scores.metrics(name).items():
+                rows[name][f"{split_name}_{metric}"] = value
+            if name in intervals:
+                _, lo, hi = intervals[name]
+                rows[name][f"{split_name}_auroc_lo"] = lo
+                rows[name][f"{split_name}_auroc_hi"] = hi
+            rows[name][f"{split_name}_n_tokens"] = len(scores)
+            rows[name][f"{split_name}_n_groups"] = int(np.unique(scores.groups).size)
+
+    return ProbeReport(rows=rows, splits=list(splits))

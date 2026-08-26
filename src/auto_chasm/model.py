@@ -721,11 +721,49 @@ class Model:
         self._steering_hooks.clear()
         self._probes.clear()
 
+    def evaluate_probes(
+        self,
+        splits: dict[str, Any],
+        *,
+        probe_names: list[str] | None = None,
+        n_boot: int = 1000,
+        ci: float = 95.0,
+        seed: int = 0,
+        cluster: bool = True,
+        batch_size: int = 8,
+        max_seq_length: int = 1024,
+    ) -> Any:
+        """One comparable per-probe table across splits — loss, acc, F1, AUROC + CI.
+
+        Identical output for a trained sweep head and a closed-form mass-mean one,
+        so the probe types can be plotted against each other.
+
+        Args:
+            splits: ``{"val": val_data, "test": test_data}``.
+            probe_names: Which probes (``None`` = all attached).
+            n_boot: Bootstrap resamples for the AUROC interval (``0`` skips).
+            ci: Interval width in percent.
+            seed: Resampling seed.
+            cluster: Resample groups rather than tokens.
+            batch_size: Batch size for the forward passes.
+            max_seq_length: Truncation length.
+
+        Returns:
+            A ``ProbeReport`` with ``.rows`` and ``.to_csv(path)``.
+        """
+        from auto_chasm.probe_scores import evaluate_probes
+
+        return evaluate_probes(
+            self, splits, probe_names=probe_names, n_boot=n_boot, ci=ci, seed=seed,
+            cluster=cluster, batch_size=batch_size, max_seq_length=max_seq_length,
+        )
+
     def fit_mass_mean(
         self,
         dataset: Any,
         *,
         probe_names: list[str] | None = None,
+        calibrate: bool = True,
         batch_size: int = 8,
         max_seq_length: int = 1024,
     ) -> dict[str, dict[str, Any]]:
@@ -738,15 +776,17 @@ class Model:
         Args:
             dataset: Data to fit the means on (the TRAIN split).
             probe_names: Which probes (``None`` = all attached).
+            calibrate: Scale so the class means sit at logits ``-+2``, making
+                loss/accuracy/F1 meaningful (AUROC is scale-invariant regardless).
             batch_size: Batch size for the forward passes.
             max_seq_length: Truncation length.
 
         Returns:
-            ``{probe: {"mean_0", "mean_1", "theta"}}`` as NumPy arrays.
+            ``{probe: {"mean_0", "mean_1", "theta", "scale", "bias"}}``.
         """
         from auto_chasm.class_means import fit_mass_mean
 
-        return fit_mass_mean(self, dataset, probe_names=probe_names,
+        return fit_mass_mean(self, dataset, probe_names=probe_names, calibrate=calibrate,
                              batch_size=batch_size, max_seq_length=max_seq_length)
 
     def hidden_states(

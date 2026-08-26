@@ -300,6 +300,7 @@ def fit_mass_mean(
     dataset: Any,
     *,
     probe_names: list[str] | None = None,
+    calibrate: bool = True,
     batch_size: int = 8,
     max_seq_length: int = 1024,
 ) -> dict[str, dict[str, Any]]:
@@ -322,6 +323,13 @@ def fit_mass_mean(
         model: A ``Model`` with single-logit linear probes attached.
         dataset: The data to fit the means on (the TRAIN split).
         probe_names: Which probes to fit (``None`` = all attached).
+        calibrate: Scale the direction so the two class means land at logits
+            ``-+2``. Without it the raw score is ``h . theta`` at whatever
+            magnitude ``|theta|`` happens to have (measured: 38-67 on a 576-dim
+            model), which leaves cross-entropy in the tens and accuracy at the
+            mercy of an arbitrary scale. AUROC is unaffected either way — it reads
+            only the ranking — so this exists to make loss/accuracy/F1 mean
+            something, and to be comparable with a trained probe.
         batch_size: Batch size for the forward passes.
         max_seq_length: Truncation length.
 
@@ -357,9 +365,15 @@ def fit_mass_mean(
             )
         # Bias puts the midpoint of the class means at logit 0 — a sensible
         # threshold for accuracy/F1. AUROC ignores it either way.
-        bias = -float(theta @ (m0 + m1) / 2.0)
-        _write_linear(module, theta, bias, model.backend.name)
-        out[name] = {"mean_0": m0, "mean_1": m1, "theta": theta}
+        scale = 1.0
+        if calibrate:
+            spread = float(theta @ (m1 - m0))  # == |theta|^2
+            scale = 4.0 / spread if spread > 0 else 1.0
+        w = theta * scale
+        bias = -float(w @ (m0 + m1) / 2.0)
+        _write_linear(module, w, bias, model.backend.name)
+        out[name] = {"mean_0": m0, "mean_1": m1, "theta": theta,
+                     "scale": scale, "bias": bias}
     return out
 
 

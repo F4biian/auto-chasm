@@ -882,6 +882,29 @@ size is irrelevant, and all layers are filled from one pass. AUROC depends only 
 `theta/|theta|`, so the scale and the bias set where the threshold sits and never
 the ranking; the bias is placed so the midpoint of the two class means scores 0.
 
+`fit_mass_mean` also **calibrates** by default: the direction is scaled so the two
+class means land at logits `±2`. Without it the raw score is `h·θ` at whatever
+magnitude `|θ|` happens to have (measured: 38–67 on a 576-dim model), leaving
+cross-entropy in the tens and not comparable with a trained probe. AUROC reads
+only the ranking, so it is identical either way — calibration exists to make
+`loss`/`acc`/`macro_f1` mean something. Pass `calibrate=False` for the raw θ.
+
+**One comparable table across probe types.** `evaluate_probes` scores every probe
+on every split and merges them into one row each — same columns whether the head
+was gradient-trained or fitted in closed form:
+
+```python
+report = model.evaluate_probes({"val": val_data, "test": test_data},
+                               n_boot=1000, ci=95.0, seed=SEED)
+report.to_csv("probes.csv")
+# probe,layer,val_loss,val_acc,val_macro_f1,val_auroc,val_auroc_lo,val_auroc_hi,
+#             val_n_tokens,val_n_groups,test_… (same)
+```
+
+`n_boot=0` skips the intervals for a quick pass. Training-only facts (which
+iteration a layer peaked at, where it plateaued) stay in `SweepResult`, because a
+closed-form fit has none.
+
 **Hidden states for plotting**, subsampled so a corpus cannot OOM you:
 
 ```python

@@ -44,8 +44,23 @@ def fitted() -> tuple[Model, Dataset, dict]:
 
 
 def test_theta_is_written_into_the_head(fitted: tuple) -> None:
-    """The head must BE the direction, or downstream scoring measures something else."""
+    """The head must POINT along the direction, or scoring measures something else.
+
+    With ``calibrate=True`` (the default) the stored weight is ``theta * scale``,
+    so equality is on the DIRECTION; ``calibrate=False`` stores theta itself.
+    """
     m, _, means = fitted
+    w = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
+    theta = means["L5"]["theta"]
+    cos = float(w @ theta / (np.linalg.norm(w) * np.linalg.norm(theta)))
+    assert cos == pytest.approx(1.0, abs=1e-4)
+
+
+def test_uncalibrated_head_is_exactly_theta() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    means = m.fit_mass_mean(tr, calibrate=False, batch_size=4, max_seq_length=128)
     w = to_numpy(m.probes["L5"].module.weight).reshape(-1)
     assert np.allclose(w, means["L5"]["theta"].astype(np.float32), rtol=1e-4, atol=1e-4)
 
@@ -132,3 +147,79 @@ def test_hidden_states_without_any_probe_explains_how() -> None:
     tr, _ = _data(m)
     with pytest.raises(ValueError, match="No single-layer probes attached"):
         m.hidden_states(tr, batch_size=2, max_seq_length=128)
+
+
+# --- the comparable per-probe table -----------------------------------------
+
+
+def test_metrics_covers_the_headline_four(fitted: tuple) -> None:
+    m, te, _ = fitted
+    ps = m.probe_scores(te, batch_size=4, max_seq_length=128)
+    got = ps.metrics("L5")
+    assert set(got) == {"loss", "acc", "macro_f1", "auroc"}
+    assert 0.0 <= got["acc"] <= 1.0
+    assert got["auroc"] == pytest.approx(ps.auroc("L5"))
+
+
+def test_calibration_fixes_the_loss_scale_without_touching_ranking() -> None:
+    """Uncalibrated, the score is h.theta at whatever |theta| happens to be.
+
+    Measured on a 576-dim model that is a median |score| near 1700 and a
+    cross-entropy in the tens -- a "loss" column that cannot be compared with a
+    trained probe's. AUROC reads only the ranking, so it must not move.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+
+    m.fit_mass_mean(tr, calibrate=False, batch_size=4, max_seq_length=128)
+    raw = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
+    m.fit_mass_mean(tr, calibrate=True, batch_size=4, max_seq_length=128)
+    cal = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
+
+    assert cal["loss"] < raw["loss"] / 10.0
+    assert cal["auroc"] == pytest.approx(raw["auroc"])
+    assert cal["acc"] == pytest.approx(raw["acc"])       # threshold is still 0
+
+
+def test_calibrated_class_means_land_near_plus_minus_two(fitted: tuple) -> None:
+    m, _, _ = fitted
+    means = m.fit_mass_mean(_data(m)[0], batch_size=4, max_seq_length=128)
+    r = means["L5"]
+    w, b = r["theta"] * r["scale"], r["bias"]
+    assert float(w @ r["mean_1"] + b) == pytest.approx(2.0, abs=1e-3)
+    assert float(w @ r["mean_0"] + b) == pytest.approx(-2.0, abs=1e-3)
+
+
+def test_report_merges_every_split_into_one_row(fitted: tuple) -> None:
+    m, te, _ = fitted
+    tr, _ = _data(m)
+    rep = m.evaluate_probes({"val": tr, "test": te}, n_boot=30, seed=0,
+                            batch_size=4, max_seq_length=128)
+    row = rep.rows["L5"]
+    assert row["layer"] == 5
+    for split in ("val", "test"):
+        for metric in ("loss", "acc", "macro_f1", "auroc", "auroc_lo", "auroc_hi"):
+            assert f"{split}_{metric}" in row
+
+
+def test_report_csv_has_probe_and_layer_first(fitted: tuple) -> None:
+    import csv
+    import tempfile
+    from pathlib import Path
+
+    m, te, _ = fitted
+    rep = m.evaluate_probes({"test": te}, n_boot=0, batch_size=4, max_seq_length=128)
+    path = Path(tempfile.mkdtemp()) / "rep.csv"
+    rep.to_csv(str(path))
+    header = next(iter(csv.reader(path.open())))
+    assert header[:2] == ["probe", "layer"]
+    assert "test_auroc" in header
+
+
+def test_report_can_skip_bootstrapping(fitted: tuple) -> None:
+    """n_boot=0 for a quick pass: metrics without paying for intervals."""
+    m, te, _ = fitted
+    rep = m.evaluate_probes({"test": te}, n_boot=0, batch_size=4, max_seq_length=128)
+    assert "test_auroc" in rep.rows["L5"]
+    assert "test_auroc_lo" not in rep.rows["L5"]
