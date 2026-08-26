@@ -192,3 +192,66 @@ def test_stop_requested_is_forwarded_to_the_running_loop() -> None:
     assert isinstance(Trainer.stop_requested, property)
     assert "self.stop_requested" in inspect.getsource(JointTrainer.run)
     assert 'getattr(trainer, "stop_requested", False)' in inspect.getsource(_torch_loop)
+
+
+# --- torch backend: metrics receive tensors, not numpy -----------------------
+
+torch = pytest.importorskip("torch", reason="torch backend not installed")
+
+
+def _devices() -> list[str]:
+    """Every accelerator available here; CUDA and MPS take the same code path."""
+    out = ["cpu"]
+    if torch.cuda.is_available():
+        out.append("cuda")
+    elif torch.backends.mps.is_available():
+        out.append("mps")
+    return out
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_auroc_accepts_device_tensors(device: str) -> None:
+    """np.asarray on a non-CPU tensor raises "can't convert cuda:0 device type".
+
+    Every other metric routes through ``to_numpy``; auroc did not, so adding it to
+    the defaults broke the ENTIRE torch training path on the first validation —
+    and the numpy-only tests never noticed.
+    """
+    s = np.array([[0.1, 0.4, 0.35, 0.8]], dtype=np.float32)
+    y = np.array([[0, 0, 1, 1]])
+    m = np.ones((1, 4), dtype=bool)
+    expected = auroc(s, y, m)
+
+    ts = torch.tensor(s, device=device)
+    ty = torch.tensor(y, device=device)
+    tm = torch.tensor(m, device=device)
+    assert auroc(ts, ty, tm) == pytest.approx(expected)
+    # the real call shape: numpy scores (already converted) + device targets/mask
+    assert auroc(s, ty, tm) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_auroc_accepts_bf16_scores(device: str) -> None:
+    """A head on the accelerator produces bf16, which NumPy cannot represent."""
+    s = torch.tensor([[0.1, 0.4, 0.35, 0.8]], device=device, dtype=torch.bfloat16)
+    y = torch.tensor([[0, 0, 1, 1]], device=device)
+    m = torch.ones((1, 4), dtype=torch.bool, device=device)
+    assert auroc(s, y, m) == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_default_metrics_run_on_device_tensors(device: str) -> None:
+    """The full eval_metrics_fn path, as the torch trainer calls it."""
+    import auto_chasm.metrics as m_mod
+
+    scores = torch.tensor([[0.1, 0.4, 0.35, 0.8]], device=device)[..., None]
+    y = torch.tensor([[0, 0, 1, 1]], device=device)
+    mask = torch.ones((1, 4), dtype=torch.bool, device=device)
+    orig = m_mod.run_probe
+    m_mod.run_probe = lambda a, b, hidden: hidden
+    try:
+        out = classification_metrics(num_classes=2)(None, {"L0": scores}, y, mask)
+    finally:
+        m_mod.run_probe = orig
+    assert out["L0_auroc"] == pytest.approx(0.75)
+    assert {"L0_acc", "L0_adj", "L0_macro_f1"} <= set(out)

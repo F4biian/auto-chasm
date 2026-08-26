@@ -313,9 +313,13 @@ def auroc(scores: Any, targets: Any, mask: Any) -> float:
         (undefined then -- the caller should OMIT the key rather than record a
         number, so the eval loop averages over the batches where it existed).
     """
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    t = np.asarray(targets).reshape(-1)
-    m = np.asarray(mask).reshape(-1).astype(bool) & (t != -100)
+    # to_numpy, NOT np.asarray: on the torch backend these arrive as tensors on
+    # the accelerator, and np.asarray raises "can't convert cuda:0 device type
+    # tensor to numpy". Every other metric here already routes through to_numpy;
+    # this one did not, so the whole torch path died on the first eval.
+    s = to_numpy(scores).astype(np.float64).reshape(-1)
+    t = to_numpy(targets).reshape(-1)
+    m = to_numpy(mask).reshape(-1).astype(bool) & (t != -100)
     s, t = s[m], t[m].astype(np.int64)
     pos = t == 1
     n_p, n_n = int(pos.sum()), int((~pos).sum())
