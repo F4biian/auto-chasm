@@ -214,3 +214,35 @@ def test_report_can_skip_bootstrapping(fitted: tuple) -> None:
     rep = m.evaluate_probes({"test": te}, n_boot=0, batch_size=4, max_seq_length=128)
     assert "test_auroc" in rep.rows["L5"]
     assert "test_auroc_lo" not in rep.rows["L5"]
+
+
+def test_report_keeps_the_scores_it_built_from(fitted: tuple) -> None:
+    """Discarding them meant probe_scores() repeated the whole forward pass.
+
+    One pass per split is all the table needs; the raw per-token scores fall out
+    of it for free, and re-running them for a CSV or a plot is pure waste.
+    """
+    m, te, _ = fitted
+    tr, _ = _data(m)
+    rep = m.evaluate_probes({"val": tr, "test": te}, n_boot=20, seed=0,
+                            batch_size=4, max_seq_length=128)
+    assert sorted(rep.scores) == ["test", "val"]
+    kept = rep.scores["test"]
+    assert kept.auroc("L5") == pytest.approx(rep.rows["L5"]["test_auroc"])
+    assert len(kept) > 0
+
+
+def test_report_runs_one_pass_per_split(fitted: tuple) -> None:
+    import auto_chasm.probe_scores as ps_mod
+
+    m, te, _ = fitted
+    tr, _ = _data(m)
+    calls = []
+    original = ps_mod.collect_probe_scores
+    ps_mod.collect_probe_scores = lambda *a, **k: (calls.append(1), original(*a, **k))[1]
+    try:
+        m.evaluate_probes({"val": tr, "test": te}, n_boot=0,
+                          batch_size=4, max_seq_length=128)
+    finally:
+        ps_mod.collect_probe_scores = original
+    assert len(calls) == 2

@@ -547,10 +547,15 @@ class ProbeReport:
     Attributes:
         rows: ``{probe_name: {column: value}}``.
         splits: Split names in the order they were evaluated.
+        scores: ``{split_name: ProbeScores}`` — the per-token scores the table was
+            built from, KEPT rather than discarded. Calling ``probe_scores`` again
+            for the same split would repeat the whole forward pass for numbers
+            already computed here.
     """
 
     rows: dict[str, dict[str, Any]]
     splits: list[str] = field(default_factory=list)
+    scores: dict[str, ProbeScores] = field(default_factory=dict)
 
     def to_csv(self, path: str) -> None:
         """Write the table; columns are derived from the rows, ``probe`` first."""
@@ -602,10 +607,13 @@ def evaluate_probes(
 
     Returns:
         A :class:`ProbeReport` with ``{split}_loss/_acc/_macro_f1/_auroc`` per
-        probe, plus ``{split}_auroc_lo/_hi`` when bootstrapping is on.
+        probe, plus ``{split}_auroc_lo/_hi`` when bootstrapping is on. Its
+        ``.scores[split]`` holds the per-token :class:`ProbeScores` behind each
+        row, so nothing needs re-running to plot or re-bootstrap them.
     """
     names = list(probe_names if probe_names is not None else model.probes)
     rows: dict[str, dict[str, Any]] = {n: {} for n in names}
+    collected: dict[str, ProbeScores] = {}
 
     for name in names:
         layers = model.probes[name].layers
@@ -617,6 +625,7 @@ def evaluate_probes(
             model, dataset, probe_names=names,
             batch_size=batch_size, max_seq_length=max_seq_length,
         )
+        collected[split_name] = scores
         intervals = (
             scores.bootstrap(n_boot=n_boot, ci=ci, seed=seed, cluster=cluster)
             if n_boot > 0
@@ -632,4 +641,4 @@ def evaluate_probes(
             rows[name][f"{split_name}_n_tokens"] = len(scores)
             rows[name][f"{split_name}_n_groups"] = int(np.unique(scores.groups).size)
 
-    return ProbeReport(rows=rows, splits=list(splits))
+    return ProbeReport(rows=rows, splits=list(splits), scores=collected)

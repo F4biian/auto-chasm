@@ -917,7 +917,15 @@ report.to_csv("probes.csv")
 #             val_n_tokens,val_n_groups,test_… (same)
 ```
 
-`n_boot=0` skips the intervals for a quick pass. Training-only facts (which
+`n_boot=0` skips the intervals for a quick pass. The per-token scores behind each
+row are **kept** on `report.scores[split]`, so plotting or re-bootstrapping needs
+no second forward pass:
+
+```python
+report.scores["test"].to_csv("ci.csv", stats=...)   # already computed
+```
+
+Training-only facts (which
 iteration a layer peaked at, where it plateaued) stay in `SweepResult`, because a
 closed-form fit has none.
 
