@@ -763,7 +763,8 @@ class Model:
         dataset: Any,
         *,
         probe_names: list[str] | None = None,
-        calibrate: bool = True,
+        calibrate_scale: bool = False,
+        calibrate_bias: bool = False,
         batch_size: int = 8,
         max_seq_length: int = 1024,
     ) -> dict[str, dict[str, Any]]:
@@ -776,8 +777,10 @@ class Model:
         Args:
             dataset: Data to fit the means on (the TRAIN split).
             probe_names: Which probes (``None`` = all attached).
-            calibrate: Scale so the class means sit at logits ``-+2``, making
-                loss/accuracy/F1 meaningful (AUROC is scale-invariant regardless).
+            calibrate_scale: Scale so the class means sit at logits ``-+2``.
+                OFF by default — the probe is the plain projection ``h . theta``.
+            calibrate_bias: Offset so their midpoint scores 0. OFF by default;
+                the bias is zeroed either way. Neither changes AUROC.
             batch_size: Batch size for the forward passes.
             max_seq_length: Truncation length.
 
@@ -786,7 +789,8 @@ class Model:
         """
         from auto_chasm.class_means import fit_mass_mean
 
-        return fit_mass_mean(self, dataset, probe_names=probe_names, calibrate=calibrate,
+        return fit_mass_mean(self, dataset, probe_names=probe_names,
+                             calibrate_scale=calibrate_scale, calibrate_bias=calibrate_bias,
                              batch_size=batch_size, max_seq_length=max_seq_length)
 
     def hidden_states(

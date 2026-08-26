@@ -43,26 +43,17 @@ def fitted() -> tuple[Model, Dataset, dict]:
     return m, te, means
 
 
-def test_theta_is_written_into_the_head(fitted: tuple) -> None:
-    """The head must POINT along the direction, or scoring measures something else.
+def test_default_is_the_plain_projection(fitted: tuple) -> None:
+    """By default a mass-mean probe IS ``h . theta`` — no scale, no bias.
 
-    With ``calibrate=True`` (the default) the stored weight is ``theta * scale``,
-    so equality is on the DIRECTION; ``calibrate=False`` stores theta itself.
+    The head arrives randomly initialised, so the bias must be actively ZEROED;
+    leaving it would offset every score by an arbitrary constant.
     """
     m, _, means = fitted
     w = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
-    theta = means["L5"]["theta"]
-    cos = float(w @ theta / (np.linalg.norm(w) * np.linalg.norm(theta)))
-    assert cos == pytest.approx(1.0, abs=1e-4)
-
-
-def test_uncalibrated_head_is_exactly_theta() -> None:
-    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
-    tr, _ = _data(m)
-    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
-    means = m.fit_mass_mean(tr, calibrate=False, batch_size=4, max_seq_length=128)
-    w = to_numpy(m.probes["L5"].module.weight).reshape(-1)
-    assert np.allclose(w, means["L5"]["theta"].astype(np.float32), rtol=1e-4, atol=1e-4)
+    assert np.allclose(w, means["L5"]["theta"], rtol=1e-4, atol=1e-3)
+    assert float(to_numpy(m.probes["L5"].module.bias)[0]) == pytest.approx(0.0, abs=1e-6)
+    assert means["L5"]["scale"] == 1.0 and means["L5"]["bias"] == 0.0
 
 
 def test_theta_is_the_difference_of_class_means(fitted: tuple) -> None:
@@ -161,30 +152,30 @@ def test_metrics_covers_the_headline_four(fitted: tuple) -> None:
     assert got["auroc"] == pytest.approx(ps.auroc("L5"))
 
 
-def test_calibration_fixes_the_loss_scale_without_touching_ranking() -> None:
-    """Uncalibrated, the score is h.theta at whatever |theta| happens to be.
+def test_calibration_changes_loss_but_never_auroc() -> None:
+    """The point of AUROC here: invariant to any positive rescale and shift.
 
-    Measured on a 576-dim model that is a median |score| near 1700 and a
-    cross-entropy in the tens -- a "loss" column that cannot be compared with a
-    trained probe's. AUROC reads only the ranking, so it must not move.
+    So the opt-in knobs can only move ``loss`` (and, via the bias, the threshold
+    metrics) -- never the layer ranking the experiment is about.
     """
     m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
     tr, te = _data(m)
     m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
 
-    m.fit_mass_mean(tr, calibrate=False, batch_size=4, max_seq_length=128)
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
     raw = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
-    m.fit_mass_mean(tr, calibrate=True, batch_size=4, max_seq_length=128)
-    cal = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
+    m.fit_mass_mean(tr, calibrate_scale=True, batch_size=4, max_seq_length=128)
+    scaled = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
 
-    assert cal["loss"] < raw["loss"] / 10.0
-    assert cal["auroc"] == pytest.approx(raw["auroc"])
-    assert cal["acc"] == pytest.approx(raw["acc"])       # threshold is still 0
+    assert scaled["loss"] < raw["loss"] / 10.0
+    assert scaled["auroc"] == pytest.approx(raw["auroc"])
+    assert scaled["acc"] == pytest.approx(raw["acc"])     # threshold is still 0
 
 
 def test_calibrated_class_means_land_near_plus_minus_two(fitted: tuple) -> None:
     m, _, _ = fitted
-    means = m.fit_mass_mean(_data(m)[0], batch_size=4, max_seq_length=128)
+    means = m.fit_mass_mean(_data(m)[0], calibrate_scale=True, calibrate_bias=True,
+                            batch_size=4, max_seq_length=128)
     r = means["L5"]
     w, b = r["theta"] * r["scale"], r["bias"]
     assert float(w @ r["mean_1"] + b) == pytest.approx(2.0, abs=1e-3)

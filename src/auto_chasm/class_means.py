@@ -300,7 +300,8 @@ def fit_mass_mean(
     dataset: Any,
     *,
     probe_names: list[str] | None = None,
-    calibrate: bool = True,
+    calibrate_scale: bool = False,
+    calibrate_bias: bool = False,
     batch_size: int = 8,
     max_seq_length: int = 1024,
 ) -> dict[str, dict[str, Any]]:
@@ -323,13 +324,17 @@ def fit_mass_mean(
         model: A ``Model`` with single-logit linear probes attached.
         dataset: The data to fit the means on (the TRAIN split).
         probe_names: Which probes to fit (``None`` = all attached).
-        calibrate: Scale the direction so the two class means land at logits
-            ``-+2``. Without it the raw score is ``h . theta`` at whatever
-            magnitude ``|theta|`` happens to have (measured: 38-67 on a 576-dim
-            model), which leaves cross-entropy in the tens and accuracy at the
-            mercy of an arbitrary scale. AUROC is unaffected either way — it reads
-            only the ranking — so this exists to make loss/accuracy/F1 mean
-            something, and to be comparable with a trained probe.
+        calibrate_scale: Scale the direction so the class means sit at logits
+            ``-+2``. OFF by default: a mass-mean probe is the plain projection
+            ``h . theta``, and scaling it is a separate choice.
+        calibrate_bias: Offset so the midpoint of the class means scores 0. OFF by
+            default, and the head's bias is ZEROED either way — leaving the random
+            initialisation there would shift every score by an arbitrary constant.
+
+    Neither affects AUROC, which reads only the ranking and is invariant to any
+    positive rescaling or shift. They exist solely to make ``loss`` (and, for the
+    bias, ``acc``/``macro_f1``) interpretable: uncalibrated, ``|theta|`` is 38-67
+    on a 576-dim model, so cross-entropy lands in the tens.
         batch_size: Batch size for the forward passes.
         max_seq_length: Truncation length.
 
@@ -363,14 +368,14 @@ def fit_mass_mean(
                 f"{None if weight is None else tuple(weight.shape)}). Build the sweep with "
                 "ModuleSpec.linear(out_features=1)."
             )
-        # Bias puts the midpoint of the class means at logit 0 — a sensible
-        # threshold for accuracy/F1. AUROC ignores it either way.
         scale = 1.0
-        if calibrate:
+        if calibrate_scale:
             spread = float(theta @ (m1 - m0))  # == |theta|^2
             scale = 4.0 / spread if spread > 0 else 1.0
         w = theta * scale
-        bias = -float(w @ (m0 + m1) / 2.0)
+        # ZERO unless asked for: the head arrives randomly initialised, and leaving
+        # that bias in place offsets every score by an arbitrary constant.
+        bias = -float(w @ (m0 + m1) / 2.0) if calibrate_bias else 0.0
         _write_linear(module, w, bias, model.backend.name)
         out[name] = {"mean_0": m0, "mean_1": m1, "theta": theta,
                      "scale": scale, "bias": bias}

@@ -882,12 +882,28 @@ size is irrelevant, and all layers are filled from one pass. AUROC depends only 
 `theta/|theta|`, so the scale and the bias set where the threshold sits and never
 the ranking; the bias is placed so the midpoint of the two class means scores 0.
 
-`fit_mass_mean` also **calibrates** by default: the direction is scaled so the two
-class means land at logits `±2`. Without it the raw score is `h·θ` at whatever
-magnitude `|θ|` happens to have (measured: 38–67 on a 576-dim model), leaving
-cross-entropy in the tens and not comparable with a trained probe. AUROC reads
-only the ranking, so it is identical either way — calibration exists to make
-`loss`/`acc`/`macro_f1` mean something. Pass `calibrate=False` for the raw θ.
+By default the probe is exactly that projection — **no scale, no bias**. The
+head's bias is actively zeroed (it arrives randomly initialised, which would offset
+every score by an arbitrary constant). Two opt-in knobs exist for when the
+*threshold* metrics matter:
+
+```python
+model.fit_mass_mean(train_data, calibrate_scale=True, calibrate_bias=True)
+```
+
+`calibrate_scale` puts the class means at logits `±2`; `calibrate_bias` puts their
+midpoint at 0. **Neither changes AUROC** — it reads only the ranking and is
+invariant to any positive rescale or shift:
+
+| | `w == θ` | bias | AUROC | loss |
+|---|---|---|---|---|
+| default | yes | 0.000 | 0.9286 | 162.39 |
+| `calibrate_scale` | no | 0.000 | **0.9286** | 0.57 |
+| both | no | −1.886 | **0.9286** | 0.30 |
+
+So they only make `loss` (and via the bias, `acc`/`macro_f1`) interpretable —
+uncalibrated, `|θ|` is 38–67 on a 576-dim model, so cross-entropy lands in the
+tens. Leave them off unless you need those columns.
 
 **One comparable table across probe types.** `evaluate_probes` scores every probe
 on every split and merges them into one row each — same columns whether the head
