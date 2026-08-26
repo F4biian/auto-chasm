@@ -256,6 +256,48 @@ def _labels_for(raw_labels: Any, name: str) -> np.ndarray:
     return np.asarray(raw_labels)
 
 
+def _iter_masked_batches(
+    model: Any,
+    samples: list[Any],
+    label_probe: list[str],
+    batch_size: int,
+    max_seq_length: int,
+) -> Any:
+    """Yield ``(tokens, labels, keep_mask, group_ids)`` per batch, forward already run.
+
+    Batches IN ORDER, unlike ``iterate_batches`` which sorts by length and
+    shuffles: that returns no way back to the originating sample, and the group id
+    a clustered bootstrap needs would be guesswork.
+    """
+    for start in range(0, len(samples), batch_size):
+        batch = samples[start : start + batch_size]
+        toks = [list(s["tokens"])[:max_seq_length] for s in batch]
+        labs = [np.asarray(_labels_for(s["labels"], label_probe[0]))[:max_seq_length]
+                for s in batch]
+        width = max(len(t) for t in toks)
+        if width < 2:  # nothing survives the next-token shift
+            continue
+
+        tok_arr = np.zeros((len(batch), width), dtype=np.int32)
+        lab_arr = np.full((len(batch), width), -100, dtype=np.float64)
+        for i, (t, y_i) in enumerate(zip(toks, labs, strict=True)):
+            tok_arr[i, : len(t)] = t
+            lab_arr[i, : len(y_i)] = y_i
+
+        for probe in model.probes.values():
+            probe.clear_captured()
+        model.forward(model.to_tensor(tok_arr)[:, :-1])
+
+        y = lab_arr[:, 1:]                       # aligns with forward(tokens[:, :-1])
+        pos = np.arange(1, width)[None, :]
+        true_len = np.array([len(t) for t in toks])[:, None]
+        keep = (pos < true_len) & (y != -100)
+        if not keep.any():
+            continue
+        gids = np.array([s.get("group", start + i) for i, s in enumerate(batch)], dtype=object)
+        yield tok_arr, y, keep, gids
+
+
 def collect_probe_scores(
     model: Any,
     dataset: Any,
@@ -310,31 +352,9 @@ def collect_probe_scores(
     label_chunks: list[np.ndarray] = []
     group_chunks: list[np.ndarray] = []
 
-    for start in range(0, len(samples), batch_size):
-        batch = samples[start : start + batch_size]
-        toks = [list(s["tokens"])[:max_seq_length] for s in batch]
-        labs = [np.asarray(_labels_for(s["labels"], names[0]))[:max_seq_length] for s in batch]
-        width = max(len(t) for t in toks)
-        if width < 2:  # nothing survives the next-token shift
-            continue
-
-        tok_arr = np.zeros((len(batch), width), dtype=np.int32)
-        lab_arr = np.full((len(batch), width), -100, dtype=np.float64)
-        for i, (t, y) in enumerate(zip(toks, labs, strict=True)):
-            tok_arr[i, : len(t)] = t
-            lab_arr[i, : len(y)] = y
-
-        for n in names:
-            model.probes[n].clear_captured()
-        model.forward(model.to_tensor(tok_arr)[:, :-1])
-
-        y = lab_arr[:, 1:]                       # aligns with forward(tokens[:, :-1])
-        pos = np.arange(1, width)[None, :]
-        true_len = np.array([len(t) for t in toks])[:, None]
-        keep = (pos < true_len) & (y != -100)
-        if not keep.any():
-            continue
-
+    for _tok_arr, y, keep, gids in _iter_masked_batches(
+        model, samples, names, batch_size, max_seq_length
+    ):
         for n in names:
             logits = to_numpy(model.probes[n].forward())
             if logits.ndim == 3 and logits.shape[-1] == 1:
@@ -346,7 +366,6 @@ def collect_probe_scores(
                 )
             chunks[n].append(logits[keep])
         label_chunks.append(y[keep])
-        gids = np.array([s.get("group", start + i) for i, s in enumerate(batch)], dtype=object)
         group_chunks.append(np.repeat(gids, keep.sum(axis=1)))
 
     if not label_chunks:
@@ -356,4 +375,134 @@ def collect_probe_scores(
         labels=np.concatenate(label_chunks).astype(np.int64),
         groups=np.concatenate(group_chunks),
         probe_names=names,
+    )
+
+
+@dataclass
+class HiddenStates:
+    """Per-token residual-stream states at one or more layers, with labels.
+
+    Attributes:
+        states: ``{layer_index: [N, hidden]}`` float32.
+        labels: ``[N]`` targets for those tokens.
+        groups: ``[N]`` cluster id (the response, or the dataset's ``"group"``).
+        n_seen: How many labeled tokens the pass encountered, before sampling.
+    """
+
+    states: dict[int, np.ndarray]
+    labels: np.ndarray
+    groups: np.ndarray
+    n_seen: int = 0
+
+    def __len__(self) -> int:
+        """Number of retained tokens."""
+        return int(self.labels.shape[0])
+
+    def class_means(self, layer: int) -> dict[str, np.ndarray]:
+        """``{"mean_0", "mean_1", "theta"}`` from the RETAINED tokens at ``layer``.
+
+        For the exact corpus means use :func:`~auto_chasm.class_means.fit_mass_mean`,
+        which streams every token instead of a sample.
+        """
+        h = self.states[layer]
+        m0 = h[self.labels == 0].mean(axis=0)
+        m1 = h[self.labels == 1].mean(axis=0)
+        return {"mean_0": m0, "mean_1": m1, "theta": m1 - m0}
+
+
+def collect_hidden_states(
+    model: Any,
+    dataset: Any,
+    *,
+    layers: list[int] | None = None,
+    max_tokens: int | None = 50_000,
+    seed: int = 0,
+    batch_size: int = 8,
+    max_seq_length: int = 1024,
+) -> HiddenStates:
+    """Per-token hidden states at ``layers``, SUBSAMPLED to bound memory.
+
+    A corpus of ~78k labeled tokens across 24 layers at 896 dims is ~6.7 GB kept
+    whole, and a scatter of millions of points is unreadable anyway. Sampling
+    happens DURING the pass, so peak memory is set by ``max_tokens`` rather than by
+    corpus size.
+
+    Capture happens through attached probes, so one must exist at each requested
+    layer — attaching temporary ones is not possible to undo cleanly (there is no
+    per-probe detach, only :meth:`Model.restore_original_layers`, which would
+    discard a sweep's trained heads).
+
+    Args:
+        model: A ``Model`` with single-layer probes attached.
+        dataset: The dataset to read.
+        layers: Layer indices. ``None`` uses every layer that has a probe.
+        max_tokens: Retain at most this many tokens. ``None`` keeps everything —
+            check the arithmetic first.
+        seed: Sampling seed.
+        batch_size: Batch size for the forward passes.
+        max_seq_length: Truncation length.
+
+    Returns:
+        A :class:`HiddenStates` with one row per retained token.
+
+    Raises:
+        ValueError: If no probe is attached at a requested layer, or the dataset
+            yields no labeled tokens.
+    """
+    from auto_chasm.metrics import to_numpy
+
+    samples = list(dataset)
+    at_layer = {p.layers[0]: n for n, p in model.probes.items() if len(p.layers) == 1}
+    if not at_layer:
+        raise ValueError(
+            "No single-layer probes attached, so nothing is capturing hidden states. "
+            "Attach one per layer first:\n"
+            "    model.add_probes([ProbeConfig(name=f'L{i}', layers=[i],\n"
+            "                                  module_config={'out_features': 1})\n"
+            "                      for i in range(model.num_layers)])"
+        )
+    if layers is None:
+        layers = sorted(at_layer)
+    missing = [i for i in layers if i not in at_layer]
+    if missing:
+        raise ValueError(
+            f"No probe is attached at layer(s) {missing}; attached layers are "
+            f"{sorted(at_layer)}. Capture happens through probes, so attach one there "
+            "(or drop those layers from layers=)."
+        )
+
+    label_probe = [next(iter(model.probes))]
+    rng = np.random.default_rng(seed)
+    kept: dict[int, list[np.ndarray]] = {i: [] for i in layers}
+    kept_y: list[np.ndarray] = []
+    kept_g: list[np.ndarray] = []
+    n_seen = 0
+    n_kept = 0
+
+    for _tok, y, keep, gids in _iter_masked_batches(
+        model, samples, label_probe, batch_size, max_seq_length
+    ):
+        n_here = int(keep.sum())
+        n_seen += n_here
+        take = np.arange(n_here)
+        if max_tokens is not None:
+            budget = max_tokens - n_kept
+            if budget <= 0:
+                break
+            if n_here > budget:
+                take = rng.choice(n_here, size=budget, replace=False)
+        for layer in layers:
+            h = to_numpy(model.probes[at_layer[layer]].get_captured_states()[0])
+            kept[layer].append(h[keep][take])
+        kept_y.append(y[keep][take])
+        kept_g.append(np.repeat(gids, keep.sum(axis=1))[take])
+        n_kept += len(take)
+
+    if not kept_y:
+        raise ValueError("No labeled tokens found — every position was masked or padding.")
+    return HiddenStates(
+        states={i: np.concatenate(kept[i]) for i in layers},
+        labels=np.concatenate(kept_y).astype(np.int64),
+        groups=np.concatenate(kept_g),
+        n_seen=n_seen,
     )

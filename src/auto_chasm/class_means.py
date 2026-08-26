@@ -293,3 +293,92 @@ def load_class_means(model: Any, path: str) -> dict[str, Any]:
         Dict with ``"mean_0"`` / ``"mean_1"`` tensors.
     """
     return model.backend.wrapping.load_class_means(path)  # type: ignore[no-any-return]
+
+
+def fit_mass_mean(
+    model: Any,
+    dataset: Any,
+    *,
+    probe_names: list[str] | None = None,
+    batch_size: int = 8,
+    max_seq_length: int = 1024,
+) -> dict[str, dict[str, Any]]:
+    """Fit a MASS-MEAN probe per attached head: no training, one streaming pass.
+
+    The direction is ``theta = mean_1 - mean_0`` over token-level hidden states,
+    and it is written INTO each probe's linear head (``weight = theta``, bias set
+    so the midpoint of the two class means scores 0). Every downstream tool then
+    works unchanged — ``model.probe_scores`` for per-token scores, its clustered
+    bootstrap for confidence intervals — because the head simply computes
+    ``h . theta`` like any other linear probe.
+
+    AUROC depends only on ``theta / |theta|``, so the scale and the bias are free
+    parameters: they set where the decision threshold sits, never the ranking.
+
+    Memory is O(hidden) per probe — sums are accumulated, states never stored — so
+    this is safe on a corpus of any size, and all probes are filled from ONE pass.
+
+    Args:
+        model: A ``Model`` with single-logit linear probes attached.
+        dataset: The data to fit the means on (the TRAIN split).
+        probe_names: Which probes to fit (``None`` = all attached).
+        batch_size: Batch size for the forward passes.
+        max_seq_length: Truncation length.
+
+    Returns:
+        ``{probe_name: {"mean_0", "mean_1", "theta"}}`` as NumPy arrays.
+
+    Raises:
+        ValueError: If a named probe's head is not a single-logit linear layer,
+            since there would be nowhere to write the direction.
+    """
+    import numpy as np
+
+    from auto_chasm.metrics import to_numpy
+
+    names = list(probe_names if probe_names is not None else model.probes)
+    probes = {n: model.probes[n] for n in names}
+    raw = compute_class_means(model, probes, dataset, model.backend.name,
+                              batch_size=batch_size, max_seq_length=max_seq_length)
+
+    out: dict[str, dict[str, Any]] = {}
+    for name in names:
+        m0 = to_numpy(raw[name]["mean_0"]).astype(np.float64)
+        m1 = to_numpy(raw[name]["mean_1"]).astype(np.float64)
+        theta = m1 - m0
+        module = probes[name].module
+        weight = getattr(module, "weight", None)
+        if weight is None or tuple(weight.shape) != (1, theta.shape[0]):
+            raise ValueError(
+                f"Probe {name!r} has no single-logit linear head to write the mass-mean "
+                f"direction into (expected weight of shape (1, {theta.shape[0]}), got "
+                f"{None if weight is None else tuple(weight.shape)}). Build the sweep with "
+                "ModuleSpec.linear(out_features=1)."
+            )
+        # Bias puts the midpoint of the class means at logit 0 — a sensible
+        # threshold for accuracy/F1. AUROC ignores it either way.
+        bias = -float(theta @ (m0 + m1) / 2.0)
+        _write_linear(module, theta, bias, model.backend.name)
+        out[name] = {"mean_0": m0, "mean_1": m1, "theta": theta}
+    return out
+
+
+def _write_linear(module: Any, theta: Any, bias: float, backend_name: str) -> None:
+    """Set a linear head's weight/bias, on either backend."""
+    import numpy as np
+
+    w = np.asarray(theta, dtype=np.float32).reshape(1, -1)
+    if backend_name == "mlx":
+        import mlx.core as mx
+
+        module.weight = mx.array(w)
+        if getattr(module, "bias", None) is not None:
+            module.bias = mx.array(np.array([bias], dtype=np.float32))
+        return
+    import torch
+
+    with torch.no_grad():
+        dev, dtype = module.weight.device, module.weight.dtype
+        module.weight.copy_(torch.tensor(w, device=dev, dtype=dtype))
+        if getattr(module, "bias", None) is not None:
+            module.bias.copy_(torch.tensor([bias], device=dev, dtype=dtype))

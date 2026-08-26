@@ -860,6 +860,44 @@ from the metrics actually produced, so a custom `eval_metrics_fn` reaches the fi
 
 ---
 
+## Mass-mean probes & hidden states
+
+A mass-mean probe needs no training: the direction is `theta = mean_1 - mean_0`
+over token-level hidden states. `fit_mass_mean` computes it in ONE streaming pass
+and writes it **into** each linear head, so it becomes an ordinary linear probe
+whose weights were computed rather than learned — and every scoring tool works on
+it unchanged:
+
+```python
+model.add_probes([ProbeConfig(name=f"L{i}", layers=[i], module_config={"out_features": 1})
+                  for i in range(model.num_layers)])
+
+means = model.fit_mass_mean(train_data)     # {layer: {"mean_0","mean_1","theta"}}
+ps = model.probe_scores(test_data)          # same API as a trained sweep
+ps.to_csv("massmean_ci.csv", n_boot=1000, ci=95.0, seed=0)
+```
+
+Memory is O(hidden) per probe — sums stream, states are never stored — so corpus
+size is irrelevant, and all layers are filled from one pass. AUROC depends only on
+`theta/|theta|`, so the scale and the bias set where the threshold sits and never
+the ranking; the bias is placed so the midpoint of the two class means scores 0.
+
+**Hidden states for plotting**, subsampled so a corpus cannot OOM you:
+
+```python
+hs = model.hidden_states(train_data, layers=[13], max_tokens=50_000, seed=0)
+hs.states[13]        # [N, hidden]      hs.labels / hs.groups   # [N]
+hs.class_means(13)   # {"mean_0","mean_1","theta"} from the retained sample
+```
+
+Sampling happens DURING the pass, so peak memory is set by `max_tokens`, not by
+corpus size (78k tokens x 24 layers x 896 dims would be ~6.7 GB kept whole).
+Capture runs through attached probes, so one must exist at each requested layer —
+there is no per-probe detach, only `restore_original_layers()`, which would
+discard a sweep's trained heads.
+
+---
+
 ## Error bars — per-token scores & clustered bootstrap
 
 An eval loop reports an aggregate and discards the `(score, label)` pairs, so

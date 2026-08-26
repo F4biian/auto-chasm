@@ -721,6 +721,65 @@ class Model:
         self._steering_hooks.clear()
         self._probes.clear()
 
+    def fit_mass_mean(
+        self,
+        dataset: Any,
+        *,
+        probe_names: list[str] | None = None,
+        batch_size: int = 8,
+        max_seq_length: int = 1024,
+    ) -> dict[str, dict[str, Any]]:
+        """Fit a mass-mean probe per head — no training, one streaming pass.
+
+        Writes ``theta = mean_1 - mean_0`` into each linear head, so every scoring
+        tool works on it unchanged (``probe_scores``, its bootstrap, the CSV).
+        Memory is O(hidden) per probe: sums stream, states are never stored.
+
+        Args:
+            dataset: Data to fit the means on (the TRAIN split).
+            probe_names: Which probes (``None`` = all attached).
+            batch_size: Batch size for the forward passes.
+            max_seq_length: Truncation length.
+
+        Returns:
+            ``{probe: {"mean_0", "mean_1", "theta"}}`` as NumPy arrays.
+        """
+        from auto_chasm.class_means import fit_mass_mean
+
+        return fit_mass_mean(self, dataset, probe_names=probe_names,
+                             batch_size=batch_size, max_seq_length=max_seq_length)
+
+    def hidden_states(
+        self,
+        dataset: Any,
+        *,
+        layers: list[int] | None = None,
+        max_tokens: int | None = 50_000,
+        seed: int = 0,
+        batch_size: int = 8,
+        max_seq_length: int = 1024,
+    ) -> Any:
+        """Per-token hidden states at ``layers``, subsampled to bound memory.
+
+        Args:
+            dataset: The dataset to read.
+            layers: Layer indices (``None`` = every layer with a probe).
+            max_tokens: Cap on retained tokens; ``None`` keeps everything.
+            seed: Sampling seed.
+            batch_size: Batch size for the forward passes.
+            max_seq_length: Truncation length.
+
+        Returns:
+            A ``HiddenStates`` with ``.states``, ``.labels``, ``.groups`` and a
+            ``class_means(layer)`` helper.
+        """
+        from auto_chasm.probe_scores import collect_hidden_states
+
+        return collect_hidden_states(
+            self, dataset, layers=layers, max_tokens=max_tokens, seed=seed,
+            batch_size=batch_size, max_seq_length=max_seq_length,
+        )
+
     def probe_scores(
         self,
         dataset: Any,
