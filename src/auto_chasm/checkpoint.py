@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING, Any
 
 from auto_chasm._checkpoint_weights import (
     load_probe_weights,
+    load_probe_whitening,
     safetensors_framework,
     save_probe_weights,
+    save_probe_whitening,
 )
 from auto_chasm.logger import get_logger
 
@@ -119,7 +121,12 @@ def save_checkpoint(model: Model, path: str) -> None:
     # Re-saving into an existing checkpoint dir must not leave stale files behind:
     # a removed probe's weights, or an adapters file from a prior LoRA save that
     # would make a now-LoRA-free reload inject a phantom adapter.
-    _prune_orphans(p / PROBES_DIR, {f"{n}.safetensors" for n in model.probes}, "*.safetensors")
+    _prune_orphans(
+        p / PROBES_DIR,
+        {f"{n}.safetensors" for n in model.probes}
+        | {f"{n}.whitening.safetensors" for n in model.probes},
+        "*.safetensors",
+    )
     _prune_orphans(p / STEERING_DIR, {f"{n}.json" for n in model.steering_hooks}, "*.json")
     if model.lora_config is None and (p / ADAPTERS_NAME).exists():
         (p / ADAPTERS_NAME).unlink()
@@ -149,7 +156,9 @@ def save_checkpoint(model: Model, path: str) -> None:
 
     for name, probe in model.probes.items():
         save_probe_weights(probe, p / PROBES_DIR / f"{name}.safetensors", model.backend)
+        save_probe_whitening(probe, p / PROBES_DIR / f"{name}.whitening.safetensors")
         manifest["probes"][name] = {
+            "whitened": probe.whitening is not None,
             "layers": probe.config.layers,
             "source": probe.config.source,
             "aggregation": probe.config.aggregation
@@ -396,6 +405,9 @@ def load_checkpoint(
     for name in probe_names:
         load_probe_weights(
             model.probes[name], p / PROBES_DIR / f"{name}.safetensors", model.backend
+        )
+        load_probe_whitening(
+            model.probes[name], p / PROBES_DIR / f"{name}.whitening.safetensors"
         )
 
     if load_steering:

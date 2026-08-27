@@ -882,6 +882,52 @@ size is irrelevant, and all layers are filled from one pass. AUROC depends only 
 `theta/|theta|`, so the scale and the bias set where the threshold sits and never
 the ranking; the bias is placed so the midpoint of the two class means scores 0.
 
+**Whitening, opt-in.** When a mass-mean probe sits far below a trained linear
+one, the usual cause is that hidden states are strongly anisotropic: `μ₁ − μ₀`
+picks up whatever high-variance nuisance direction happens to lie between the
+centroids, and a plain projection cannot discount it.
+
+```python
+model.fit_mass_mean(train_data, whiten=True)      # scores Sigma^-1/2 (h - mu)
+```
+
+Fitting adds two quantities describing the hidden states — the overall mean `μ`
+and covariance `Σ` — accumulated in the SAME pass as the class means. Every state
+is then centered and whitened before the projection:
+
+```
+h_white = Σ^(-1/2) (h − μ)
+```
+
+Both are **label-free**: `μ` and `Σ` know nothing about the classes, so the
+transform applies to any state, including unlabelled tokens at generation time.
+Only the direction uses labels, exactly as the plain probe already does.
+
+This is deliberately not LDA (which whitens by the *within-class* covariance).
+For two classes the two give **identical AUROC** — `S_total = S_within +
+(n₀n₁/n)·θθᵀ`, a rank-one term along θ, so by Sherman–Morrison `Σ_t⁻¹θ` is a
+positive multiple of `Σ_w⁻¹θ`: same ranking, different length. The label-free
+version is therefore free, and reaches further. Both facts are pinned by tests.
+
+The transform is stored on the probe and saved with the checkpoint, so it
+outlives the process:
+
+```python
+model.fit_mass_mean(train_data, whiten=True)
+model.save_checkpoint("ck/")
+
+m = Model.from_checkpoint("ck/")
+m.probes["L20"].whitening["mean"]        # mu, Sigma^-1/2 and Sigma
+m.probes["L20"].whiten(hidden_states)    # apply it to any states yourself
+```
+
+Scoring needs no extra work at inference: the transform folds into the head's
+weight and bias, so `probe_scores` and the sweeps are unchanged. It costs one
+`hidden × hidden` matrix per probe while fitting (26 MB at hidden=2560, so ~950 MB
+across 36 layers) and needs far more states than dimensions to estimate well — it
+warns when they are scarce, and `shrinkage` ridges `Σ` before the inverse root.
+Off by default: the plain probe stays the plain difference of means.
+
 By default the probe is exactly that projection — **no scale, no bias**. The
 head's bias is actively zeroed (it arrives randomly initialised, which would offset
 every score by an arbitrary constant). Two opt-in knobs exist for when the

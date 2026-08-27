@@ -763,6 +763,8 @@ class Model:
         dataset: Any,
         *,
         probe_names: list[str] | None = None,
+        whiten: bool = False,
+        shrinkage: float = 1e-2,
         calibrate_scale: bool = False,
         calibrate_bias: bool = False,
         batch_size: int = 8,
@@ -777,6 +779,14 @@ class Model:
         Args:
             dataset: Data to fit the means on (the TRAIN split).
             probe_names: Which probes (``None`` = all attached).
+            whiten: Also fit the LABEL-FREE whitening transform of the hidden
+                states, ``h_white = Sigma^-1/2 (h - mu)``, and score in that
+                space. The transform is stored on the probe (``probe.whitening``,
+                ``probe.whiten(h)``) and saved with the checkpoint. OFF by
+                default, so the probe stays the plain projection. Costs one
+                ``hidden x hidden`` matrix per probe and still runs in one pass.
+            shrinkage: Ridge on the covariance, as a fraction of its mean
+                eigenvalue, before solving.
             calibrate_scale: Scale so the class means sit at logits ``-+2``.
                 OFF by default — the probe is the plain projection ``h . theta``.
             calibrate_bias: Offset so their midpoint scores 0. OFF by default;
@@ -790,6 +800,7 @@ class Model:
         from auto_chasm.class_means import fit_mass_mean
 
         return fit_mass_mean(self, dataset, probe_names=probe_names,
+                             whiten=whiten, shrinkage=shrinkage,
                              calibrate_scale=calibrate_scale, calibrate_bias=calibrate_bias,
                              batch_size=batch_size, max_seq_length=max_seq_length)
 

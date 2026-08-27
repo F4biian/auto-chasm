@@ -429,8 +429,42 @@ class Probe:
         # pools over all valid (non-padding) positions — the documented default.
         self.prompt_len: int | None = None
 
+        #: Label-free whitening transform fitted by ``fit_mass_mean(whiten=True)``:
+        #: ``{"mean", "whitener", "cov"}`` as NumPy arrays, or None. Saved and
+        #: restored with the checkpoint so the transform outlives the process.
+        self.whitening: dict[str, Any] | None = None
         self.module = self._build_module()
         self._log_params()
+
+    def whiten(self, states: Any) -> Any:
+        """Apply the fitted whitening transform: ``Sigma^-1/2 (h - mu)``.
+
+        The mean and covariance are fitted label-free over the hidden states, so
+        this applies to ANY state — including tokens with no label, at generation
+        time. The probe already scores whitened states internally (the transform
+        is folded into its weight and bias); this exposes the transform itself,
+        for looking at the geometry of the whitened space directly.
+
+        Args:
+            states: ``[..., hidden]`` array of hidden states, any backend or NumPy.
+
+        Returns:
+            The whitened states as a NumPy array of the same shape.
+
+        Raises:
+            RuntimeError: If no whitening has been fitted for this probe.
+        """
+        import numpy as np
+
+        from auto_chasm.metrics import to_numpy
+
+        if self.whitening is None:
+            raise RuntimeError(
+                f"Probe {self.name!r} has no whitening transform. Fit one with "
+                "model.fit_mass_mean(train_data, whiten=True)."
+            )
+        h = np.asarray(to_numpy(states), dtype=np.float64)
+        return (h - self.whitening["mean"]) @ self.whitening["whitener"].T
 
     @property
     def name(self) -> str:

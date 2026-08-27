@@ -9,6 +9,8 @@ never the ranking.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -246,3 +248,213 @@ def test_report_runs_one_pass_per_split(fitted: tuple) -> None:
     finally:
         ps_mod.collect_probe_scores = original
     assert len(calls) == 2
+
+
+# --- label-free whitening ---------------------------------------------------
+
+
+def test_whitening_recovers_a_direction_a_plain_projection_cannot() -> None:
+    """The mechanism, on data built to have exactly that structure.
+
+    Hidden states are strongly anisotropic, so ``mu_1 - mu_0`` picks up whatever
+    high-variance nuisance direction lies between the centroids. A plain
+    projection cannot discount it; whitening the states can. Note the transform
+    itself never sees ``y`` -- only the direction does.
+    """
+    rng = np.random.default_rng(0)
+    dim, n = 60, 8000
+    mixing = rng.normal(0, 1, (dim, dim))
+    mixing[:, 0] *= 12                       # a dominant nuisance direction
+    y = rng.integers(0, 2, n)
+    signal = np.zeros(dim)
+    signal[3] = 1.0                          # the true class axis, low variance
+    x = rng.normal(0, 1, (n, dim)) @ mixing.T + y[:, None] * signal * 6.0
+    tr, te = slice(0, n // 2), slice(n // 2, None)
+
+    xtr, ytr = x[tr], y[tr]
+    theta = xtr[ytr == 1].mean(0) - xtr[ytr == 0].mean(0)
+    mu = xtr.mean(0)                                        # label-free
+    cov = (xtr - mu).T @ (xtr - mu) / (len(xtr) - 1)        # label-free
+    cov.flat[:: dim + 1] += 1e-3 * np.trace(cov) / dim
+    evals, evecs = np.linalg.eigh(cov)
+    whitener = (evecs * evals**-0.5) @ evecs.T
+
+    ones = np.ones(n - n // 2, dtype=bool)
+    plain = auroc(x[te] @ theta, y[te], ones)
+    whitened = auroc((x[te] - mu) @ whitener.T @ (whitener @ theta), y[te], ones)
+    assert plain < 0.65
+    assert whitened > 0.90
+
+
+def test_whitening_matches_lda_on_auroc_exactly() -> None:
+    """Two-class LDA and label-free whitening give the SAME ranking.
+
+    ``S_total = S_within + (n0 n1 / n) theta theta^T`` -- the between-class term
+    is rank one ALONG theta -- so by Sherman-Morrison ``Sigma_t^-1 theta`` is a
+    POSITIVE multiple of ``Sigma_w^-1 theta``. Same direction, different length,
+    and AUROC reads only the ranking. This is why the label-free transform costs
+    nothing in AUROC while still applying to unlabelled states.
+    """
+    rng = np.random.default_rng(0)
+    dim, n = 40, 6000
+    mixing = rng.normal(0, 1, (dim, dim))
+    mixing[:, 0] *= 12
+    y = (rng.random(n) < 0.166).astype(int)          # imbalanced, as in real data
+    signal = np.zeros(dim)
+    signal[3] = 1.0
+    x = rng.normal(0, 1, (n, dim)) @ mixing.T + y[:, None] * signal * 6.0
+
+    m0, m1 = x[y == 0].mean(0), x[y == 1].mean(0)
+    theta = m1 - m0
+    mu = x.mean(0)
+    s_total = (x - mu).T @ (x - mu)
+    s_within = ((x[y == 0] - m0).T @ (x[y == 0] - m0)
+                + (x[y == 1] - m1).T @ (x[y == 1] - m1))
+
+    n0, n1 = float((y == 0).sum()), float((y == 1).sum())
+    assert np.allclose(s_total - s_within, (n0 * n1 / n) * np.outer(theta, theta))
+
+    free = np.linalg.solve(s_total, theta)
+    lda = np.linalg.solve(s_within, theta)
+    cos = free @ lda / (np.linalg.norm(free) * np.linalg.norm(lda))
+    assert cos == pytest.approx(1.0, abs=1e-9)
+
+
+def test_whiten_is_off_by_default() -> None:
+    import inspect
+
+    from auto_chasm.class_means import fit_mass_mean
+
+    assert inspect.signature(fit_mass_mean).parameters["whiten"].default is False
+
+
+def test_plain_fit_leaves_no_whitening_on_the_probe(fitted: tuple) -> None:
+    model, _, _ = fitted
+    assert all(p.whitening is None for p in model.probes.values())
+
+
+def test_whitened_direction_differs_from_theta() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    plain = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    white = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
+
+    cos = float(plain @ white / (np.linalg.norm(plain) * np.linalg.norm(white)))
+    assert cos < 0.99          # genuinely rotated, not merely rescaled
+
+
+def test_refitting_without_whiten_clears_the_transform() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    assert m.probes["L5"].whitening is not None
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    assert m.probes["L5"].whitening is None
+
+
+def test_probe_scores_equal_scoring_the_whitened_state_by_hand() -> None:
+    """The folded weight/bias must agree with the exposed transform.
+
+    The head computes ``w . h + b``; the transform says the score is
+    ``theta_white . Sigma^-1/2 (h - mu)``. If these ever drift apart, the probe
+    and the geometry would be describing different spaces.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+
+    hs = m.hidden_states(te, batch_size=4, max_seq_length=128)
+    h = hs.states[5].astype(np.float64)
+    probe = m.probes["L5"]
+    w = to_numpy(probe.module.weight).reshape(-1).astype(np.float64)
+    b = float(to_numpy(probe.module.bias).reshape(-1)[0])
+
+    by_head = h @ w + b
+    by_hand = probe.whiten(h) @ res["L5"]["theta_whitened"]
+    assert np.allclose(by_head, by_hand, rtol=1e-4, atol=1e-4)
+
+
+def test_whiten_without_a_fit_says_how_to_get_one(fitted: tuple) -> None:
+    model, _, _ = fitted
+    probe = next(iter(model.probes.values()))
+    with pytest.raises(RuntimeError, match="whiten=True"):
+        probe.whiten(np.zeros((3, probe.hidden_dim)))
+
+
+def test_whitening_warns_when_tokens_are_scarce(caplog: pytest.LogCaptureFixture) -> None:
+    """A hidden x hidden covariance from fewer states than dimensions is noise."""
+    import logging
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    with caplog.at_level(logging.WARNING):
+        m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    # getMessage() applies the args; .message is the raw format string.
+    assert any("whitening a" in r.getMessage() for r in caplog.records)
+
+
+def test_whitening_survives_a_checkpoint_round_trip(tmp_path: Path) -> None:
+    """Saving a whitened probe must carry mu and Sigma^-1/2 with it."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    before = m.probes["L5"].whitening
+    assert before is not None
+    hs = m.hidden_states(te, batch_size=4, max_seq_length=128)
+    h = hs.states[5].astype(np.float64)
+    whitened_before = m.probes["L5"].whiten(h)
+    scores_before = np.asarray(
+        m.probe_scores(te, batch_size=4, max_seq_length=128).scores["L5"]
+    )
+
+    m.save_checkpoint(str(tmp_path / "ck"))
+    restored = Model.from_checkpoint(str(tmp_path / "ck"),
+                                     base_model="HuggingFaceTB/SmolLM2-135M")
+
+    after = restored.probes["L5"].whitening
+    assert after is not None
+    for key in ("mean", "whitener", "cov"):
+        assert np.allclose(before[key], after[key]), key
+    assert np.allclose(whitened_before, restored.probes["L5"].whiten(h))
+    # ...and the reloaded probe must actually SCORE the same, not merely carry
+    # the same arrays: the transform is folded into the head's weight and bias.
+    scores_after = np.asarray(
+        restored.probe_scores(te, batch_size=4, max_seq_length=128).scores["L5"]
+    )
+    assert np.allclose(scores_before, scores_after)
+
+
+def test_checkpoint_without_whitening_restores_none(tmp_path: Path) -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    m.save_checkpoint(str(tmp_path / "ck"))
+    restored = Model.from_checkpoint(str(tmp_path / "ck"),
+                                     base_model="HuggingFaceTB/SmolLM2-135M")
+    assert restored.probes["L5"].whitening is None
+
+
+def test_resaving_without_whitening_removes_the_stale_file(tmp_path: Path) -> None:
+    """A refit that drops whitening must not leave the old transform on disk."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    ck = tmp_path / "ck"
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    m.save_checkpoint(str(ck))
+    stale = ck / "probes" / "L5.whitening.safetensors"
+    assert stale.exists()
+
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    m.save_checkpoint(str(ck))
+    assert not stale.exists()
+    assert (ck / "probes" / "L5.safetensors").exists()   # weights kept, not pruned

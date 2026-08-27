@@ -64,6 +64,52 @@ def save_probe_weights(probe: Probe, path: Path, backend: Backend) -> None:
         logger.warning("Could not save probe weights for '%s': %s", probe.name, e)
 
 
+def save_probe_whitening(probe: Probe, path: Path) -> None:
+    """Write a probe's whitening transform, if it has one.
+
+    Kept in its own file rather than folded into the probe weights: the loader
+    validates those keys against the module's ``state_dict`` and would reject the
+    extra entries. Written through NumPy, so an MLX-fitted transform reloads on
+    torch and vice versa.
+
+    Args:
+        probe: The ``Probe`` instance.
+        path: Destination ``*.whitening.safetensors`` path.
+    """
+    if probe.whitening is None:
+        if path.exists():
+            path.unlink()  # a refit without whitening must not leave a stale one
+        return
+    try:
+        import numpy as np
+        from safetensors.numpy import save_file as np_save
+
+        np_save({k: np.ascontiguousarray(v, dtype=np.float64)
+                 for k, v in probe.whitening.items()}, str(path))
+    except Exception as e:
+        logger.warning("Could not save whitening for '%s': %s", probe.name, e)
+
+
+def load_probe_whitening(probe: Probe, path: Path) -> None:
+    """Restore a probe's whitening transform if one was saved beside it.
+
+    Absence is not an error: only mass-mean probes fitted with ``whiten=True``
+    have one.
+
+    Args:
+        probe: The ``Probe`` instance.
+        path: The ``*.whitening.safetensors`` path.
+    """
+    if not path.exists():
+        return
+    try:
+        from safetensors.numpy import load_file as np_load
+
+        probe.whitening = dict(np_load(str(path)))
+    except Exception as e:
+        logger.warning("Could not load whitening for '%s': %s", probe.name, e)
+
+
 def _expected_mlx_shapes(probe: Probe) -> dict[str, tuple[int, ...]]:
     """Return the probe module's parameter shapes as a flat ``{key: shape}`` map.
 
