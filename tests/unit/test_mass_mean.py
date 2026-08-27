@@ -458,3 +458,149 @@ def test_resaving_without_whitening_removes_the_stale_file(tmp_path: Path) -> No
     m.save_checkpoint(str(ck))
     assert not stale.exists()
     assert (ck / "probes" / "L5.safetensors").exists()   # weights kept, not pruned
+
+
+# --- automatic (Ledoit-Wolf) shrinkage ---------------------------------------
+
+
+def _many_conversations(n_conv: int) -> list:
+    """A corpus large enough that the covariance is actually determined."""
+    return [
+        [{"role": "user", "content": f"Who built device {p}?"},
+         {"role": "assistant",
+          "content": (f"It was Nikola Tesla in {1900 + p}." if p % 2 == 0
+                      else f"It was Alexander Bell in {1900 + p}."),
+          "labels": {"halluc": [{"start": 7, "end": 19, "label": 1}]
+                     if p % 2 == 0 else []}}]
+        for p in range(n_conv)
+    ]
+
+
+def _lw_rho_batch(h: np.ndarray) -> float:
+    """Ledoit-Wolf intensity computed the obvious way: whole matrix in memory."""
+    n, d = h.shape
+    x = h - h.mean(0)
+    cov = x.T @ x / n
+    m = np.trace(cov) / d
+    d2 = np.sum(cov * cov) / d - m * m
+    b2_bar = (np.sum(np.sum(x * x, axis=1) ** 2) - n * np.sum(cov * cov)) / (n * n * d)
+    return float(min(max(b2_bar, 0.0), d2) / d2)
+
+
+def test_auto_shrinkage_matches_a_batch_reference() -> None:
+    """Our ONE-PASS Ledoit-Wolf must equal the same formula computed in batch.
+
+    The fourth moment is accumulated about a frozen offset and corrected to the
+    true mean afterwards. That algebra is the part most likely to be silently
+    wrong -- it would surface only as a quietly mis-tuned ridge, never an error.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(200),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, shrinkage="auto",
+                          batch_size=8, max_seq_length=128)
+    lam = res["L5"]["shrinkage"]
+    rho_ours = lam / (1.0 + lam)          # undo lambda = rho / (1 - rho)
+
+    hs = m.hidden_states(tr, batch_size=8, max_seq_length=128, max_tokens=None)
+    # Loose on purpose: b^2 is a difference of two large near-equal quantities,
+    # and the moments are accumulated in float32 (MLX has no float64 on GPU), so
+    # ~1e-3 is the precision floor -- it lands at 1e-9 on the GPU and 4e-4 on the
+    # CPU the tests pin. Irrelevant for a ridge coefficient. The exact algebra is
+    # pinned in float64 by test_lw_algebra_recovers_the_fourth_moment_exactly.
+    assert rho_ours == pytest.approx(_lw_rho_batch(hs.states[5].astype(np.float64)),
+                                     rel=1e-2)
+
+
+def test_lw_algebra_recovers_the_fourth_moment_exactly() -> None:
+    """Pin the offset correction itself, in float64, with the offset far off.
+
+    ``_lw_shrinkage`` reconstructs ``sum ||x - mu||^4`` from moments taken about a
+    frozen offset ``o``. When ``o`` happens to sit near the mean those correction
+    terms are tiny, so an end-to-end test would pass even with one of them
+    dropped. Here ``o`` is deliberately far away, which makes every term matter.
+    """
+    from auto_chasm.class_means import _lw_shrinkage
+
+    rng = np.random.default_rng(0)
+    n, d = 900, 40
+    mixing = rng.normal(0, 1, (d, d))
+    mixing[:, 0] *= 8
+    x = rng.normal(0, 1, (n, d)) @ mixing.T + 5.0
+
+    offset = x.mean(0) + 30.0            # nowhere near the mean
+    g = x - offset
+    delta = x.mean(0) - offset
+    entry = {
+        "counts": (n / 2.0, n / 2.0),
+        "scatter": g.T @ g - n * np.outer(delta, delta),   # centered on the mean
+        "mean": x.mean(0),
+        "m2": g.T @ g,
+        "s4": float(np.sum(np.sum(g * g, axis=1) ** 2)),
+        "v3": (g * np.sum(g * g, axis=1)[:, None]).sum(0),
+        "offset": offset,
+    }
+    lam = _lw_shrinkage(entry, "probe")
+    # rel=1e-6, not tighter: pushing the offset this far makes the correction
+    # terms ~1e5x the answer, so even float64 loses digits recombining them. It
+    # stays hugely discriminating -- dropping any single term moves the result by
+    # orders of magnitude, not parts per million.
+    assert lam / (1.0 + lam) == pytest.approx(_lw_rho_batch(x), rel=1e-6)
+
+
+def test_auto_shrinkage_matches_the_sklearn_reference() -> None:
+    """And the formula itself matches the canonical implementation."""
+    cov_mod = pytest.importorskip("sklearn.covariance")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(200),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, shrinkage="auto",
+                          batch_size=8, max_seq_length=128)
+    lam = res["L5"]["shrinkage"]
+    rho_ours = lam / (1.0 + lam)
+
+    hs = m.hidden_states(tr, batch_size=8, max_seq_length=128, max_tokens=None)
+    rho_sklearn = cov_mod.ledoit_wolf_shrinkage(
+        hs.states[5].astype(np.float64), assume_centered=False
+    )
+    assert rho_ours == pytest.approx(rho_sklearn, rel=1e-6)
+
+
+def test_auto_is_not_the_default() -> None:
+    import inspect
+
+    from auto_chasm.class_means import fit_mass_mean
+
+    assert inspect.signature(fit_mass_mean).parameters["shrinkage"].default == 1e-2
+
+
+def test_auto_reports_the_coefficient_it_picked() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, shrinkage="auto",
+                          batch_size=4, max_seq_length=128)
+    lam = res["L5"]["shrinkage"]
+    assert np.isfinite(lam) and lam > 0.0
+    # and a fixed value is echoed back unchanged, so the field always means the
+    # coefficient actually applied
+    fixed = m.fit_mass_mean(tr, whiten=True, shrinkage=0.05,
+                            batch_size=4, max_seq_length=128)
+    assert fixed["L5"]["shrinkage"] == 0.05
+
+
+def test_auto_shrinks_harder_when_data_is_scarcer() -> None:
+    """Less data per dimension -> a noisier covariance -> more shrinkage."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    lams = []
+    for n_conv in (8, 120):
+        ds = Dataset.from_conversations(conversations=_many_conversations(n_conv),
+                                        tokenizer=m.tokenizer, default_label=0)
+        r = m.fit_mass_mean(ds, whiten=True, shrinkage="auto",
+                            batch_size=4, max_seq_length=128)
+        lams.append(r["L5"]["shrinkage"])
+    assert lams[0] > lams[1]

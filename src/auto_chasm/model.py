@@ -764,7 +764,7 @@ class Model:
         *,
         probe_names: list[str] | None = None,
         whiten: bool = False,
-        shrinkage: float = 1e-2,
+        shrinkage: float | str = 1e-2,
         calibrate_scale: bool = False,
         calibrate_bias: bool = False,
         batch_size: int = 8,
@@ -785,7 +785,8 @@ class Model:
                 ``probe.whiten(h)``) and saved with the checkpoint. OFF by
                 default, so the probe stays the plain projection. Costs one
                 ``hidden x hidden`` matrix per probe and still runs in one pass.
-            shrinkage: Ridge on the covariance, as a fraction of its mean
+            shrinkage: ``"auto"`` for the closed-form Ledoit-Wolf optimum (no
+                sweep needed), or a ridge on the covariance as a fraction of its mean
                 eigenvalue, before solving.
             calibrate_scale: Scale so the class means sit at logits ``-+2``.
                 OFF by default — the probe is the plain projection ``h . theta``.

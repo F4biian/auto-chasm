@@ -928,6 +928,31 @@ across 36 layers) and needs far more states than dimensions to estimate well —
 warns when they are scarce, and `shrinkage` ridges `Σ` before the inverse root.
 Off by default: the plain probe stays the plain difference of means.
 
+**Choosing `shrinkage` automatically.** `shrinkage="auto"` uses the closed-form
+optimum of [Ledoit & Wolf (2004)](https://www.sciencedirect.com/science/article/pii/S0047259X03000964),
+so there is nothing to sweep and nothing to tune on held-out data:
+
+```python
+model.fit_mass_mean(train_data, whiten=True, shrinkage="auto")
+```
+
+With `<A,B> = tr(AB^T)/d`, the sample covariance `S`, and `m = tr(S)/d`:
+
+```
+d2  = ||S - m I||^2
+b2  = min( (1/n^2) sum_i ||x_i x_i^T - S||^2 ,  d2 )
+rho = b2 / d2                       # Sigma_hat = (1 - rho) S + rho m I
+```
+
+We apply it as `S + lambda m I`, which is the same estimator up to a positive
+scalar AUROC ignores, with `lambda = rho / (1 - rho)`. Everything it needs comes
+from the pass we already run: `sum_i ||x_i x_i^T - S||^2` reduces to
+`sum_i ||x_i||^4 - n tr(S^2)`, so one extra scalar and one extra vector suffice.
+The chosen coefficient is returned as `result[probe]["shrinkage"]`.
+
+It optimises error on the *covariance*, not AUROC, so a sweep can still edge it
+out slightly — what it removes is an ablation and a tuning decision.
+
 By default the probe is exactly that projection — **no scale, no bias**. The
 head's bias is actively zeroed (it arrives randomly initialised, which would offset
 every score by an arbitrary constant). Two opt-in knobs exist for when the

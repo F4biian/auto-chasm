@@ -70,6 +70,11 @@ def compute_class_means(
             result[probe_name]["scatter"] = accum.scatter(probe_name)
             result[probe_name]["mean"] = accum.mean(probe_name)
             result[probe_name]["counts"] = tuple(accum.counts[probe_name])
+            # Raw, offset-relative moments -- only Ledoit-Wolf needs these.
+            result[probe_name]["m2"] = accum.m2[probe_name]
+            result[probe_name]["s4"] = accum.s4[probe_name]
+            result[probe_name]["v3"] = accum.v3[probe_name]
+            result[probe_name]["offset"] = accum.offset.get(probe_name)
     return result
 
 
@@ -101,6 +106,11 @@ class _MultiProbeAccumulator:
                          for n, p in probes.items()}
             self.m2 = ({n: mx.zeros((p.hidden_dim, p.hidden_dim)) for n, p in probes.items()}
                        if second_moment else {})
+            # Ledoit-Wolf needs sum ||g||^4 and sum ||g||^2 g -- a scalar and a
+            # vector, so "auto" shrinkage costs no meaningful memory or time.
+            self.s4: dict[str, float] = dict.fromkeys(probes, 0.0) if second_moment else {}
+            self.v3 = ({n: mx.zeros(p.hidden_dim) for n, p in probes.items()}
+                       if second_moment else {})
         else:
             import torch
 
@@ -109,6 +119,9 @@ class _MultiProbeAccumulator:
                              torch.zeros(p.hidden_dim, device=dev)]
                          for n, p in probes.items()}
             self.m2 = ({n: torch.zeros((p.hidden_dim, p.hidden_dim), device=dev)
+                        for n, p in probes.items()} if second_moment else {})
+            self.s4 = dict.fromkeys(probes, 0.0) if second_moment else {}
+            self.v3 = ({n: torch.zeros(p.hidden_dim, device=dev)
                         for n, p in probes.items()} if second_moment else {})
 
     def step(self, raw_tokens: Any, raw_labels: Any, lengths: Any) -> None:
@@ -146,7 +159,13 @@ class _MultiProbeAccumulator:
                         # Subtract BEFORE masking, so padded rows stay exactly zero.
                         hv = ((h - self.offset[name]) * vf).reshape(-1, h.shape[-1])
                         self.m2[name] = self.m2[name] + (hv.T @ hv)
-                        mx.eval(self.m2[name])
+                        # Padded rows are exactly zero, so they add nothing here.
+                        sq = mx.sum(hv * hv, axis=-1)
+                        self.s4[name] += float(mx.sum(sq * sq))
+                        self.v3[name] = self.v3[name] + mx.sum(
+                            hv * mx.expand_dims(sq, -1), axis=0
+                        )
+                        mx.eval(self.m2[name], self.v3[name])
                 mx.eval(*self.sums[name])
             return
         import torch
@@ -178,6 +197,10 @@ class _MultiProbeAccumulator:
                     # Subtract BEFORE masking, so padded rows stay exactly zero.
                     hv = ((h - self.offset[name]) * valid).reshape(-1, h.shape[-1])
                     self.m2[name] += hv.T @ hv
+                    # Padded rows are exactly zero, so they add nothing here.
+                    sq = (hv * hv).sum(dim=-1)
+                    self.s4[name] += float((sq * sq).sum().item())
+                    self.v3[name] += (hv * sq.unsqueeze(-1)).sum(dim=0)
 
     def scatter(self, name: str) -> Any:
         """Scatter about the OVERALL mean: ``sum_i (h_i - mu)(h_i - mu)^T``.
@@ -382,7 +405,7 @@ def fit_mass_mean(
     *,
     probe_names: list[str] | None = None,
     whiten: bool = False,
-    shrinkage: float = 1e-2,
+    shrinkage: float | str = 1e-2,
     calibrate_scale: bool = False,
     calibrate_bias: bool = False,
     batch_size: int = 8,
@@ -430,6 +453,13 @@ def fit_mass_mean(
         shrinkage: Ridge added to the covariance as a fraction of its mean
             eigenvalue, before the inverse square root. Without it the small
             eigenvalues are noise and ``1/sqrt`` of them is enormous.
+
+            Pass ``"auto"`` for the Ledoit-Wolf (2004) optimal intensity, computed
+            in closed form from the same single pass -- no sweep, no held-out
+            tuning. It minimises expected error on the COVARIANCE, which is not
+            quite AUROC, so a sweep may still edge it out by a little; what it
+            buys is a principled, reproducible default. The coefficient actually
+            applied is returned as ``"shrinkage"``.
         calibrate_scale: Scale the direction so the class means sit at logits
             ``-+2``. OFF by default: a mass-mean probe is the plain projection
             ``h . theta``, and scaling it is a separate choice.
@@ -512,8 +542,76 @@ def fit_mass_mean(
     return out
 
 
+def _lw_shrinkage(entry: dict[str, Any], name: str) -> float:
+    """Ledoit-Wolf optimal shrinkage intensity, as a ridge coefficient.
+
+    Implements the estimator of Ledoit & Wolf (2004), "A well-conditioned
+    estimator for large-dimensional covariance matrices", J. Multivar. Anal.
+    88(2):365-411. With the normalised inner product ``<A,B> = tr(A B^T)/d``,
+    the sample covariance ``S``, and target ``m I`` where ``m = tr(S)/d``::
+
+        d2      = ||S - m I||^2
+        b2_bar  = (1/n^2) sum_i ||x_i x_i^T - S||^2
+        b2      = min(b2_bar, d2)
+        rho     = b2 / d2                       <- the shrinkage intensity
+
+    giving ``Sigma_hat = (1 - rho) S + rho m I``. We apply shrinkage in the
+    additive form ``S + lambda m I``, and the two agree up to a positive scalar::
+
+        (1 - rho) S + rho m I = (1 - rho) [ S + (rho / (1 - rho)) m I ]
+
+    so this returns ``lambda = rho / (1 - rho)``. The leftover ``(1 - rho)``
+    rescales the direction uniformly, which AUROC ignores.
+
+    The whole thing is computed from moments already accumulated in the single
+    pass. ``sum_i ||x_i x_i^T - S||^2`` expands to ``sum_i ||x_i||^4 - n tr(S^2)``,
+    and the fourth moment about the true mean is recovered from the
+    offset-relative one (``g_i = h_i - o``, ``delta = mu - o``, ``k = delta.delta``,
+    using ``sum_i g_i = n delta``)::
+
+        sum_i ||x_i||^4 = S4 - 4 v3.delta + 4 delta^T M delta
+                             + 2 k tr(M) - 3 n k^2
+
+    Returns:
+        The ridge coefficient ``lambda >= 0``. Zero when the sample covariance
+        already matches the target, and large when it is mostly noise.
+    """
+    import numpy as np
+
+    from auto_chasm.metrics import to_numpy
+
+    n = float(sum(entry["counts"]))
+    scatter = to_numpy(entry["scatter"]).astype(np.float64)
+    dim = scatter.shape[0]
+    if n < 2:
+        logger.warning("Probe %r: too few states for auto shrinkage; using 1e-2.", name)
+        return 1e-2
+
+    cov = scatter / n  # LW's S is the biased (1/n) sample covariance
+    m = float(np.trace(cov)) / dim
+    d2 = float(np.sum(cov * cov)) / dim - m * m
+
+    m2 = to_numpy(entry["m2"]).astype(np.float64)
+    v3 = to_numpy(entry["v3"]).astype(np.float64)
+    s4 = float(entry["s4"])
+    off = entry["offset"]
+    delta = to_numpy(entry["mean"]).astype(np.float64) - (
+        np.zeros(dim) if off is None else to_numpy(off).astype(np.float64)
+    )
+    k = float(delta @ delta)
+    fourth = (s4 - 4.0 * float(v3 @ delta) + 4.0 * float(delta @ m2 @ delta)
+              + 2.0 * k * float(np.trace(m2)) - 3.0 * n * k * k)
+
+    b2_bar = (fourth - n * float(np.sum(cov * cov))) / (n * n * dim)
+    b2 = min(max(b2_bar, 0.0), d2)
+    if d2 <= 0.0:
+        return 0.0
+    rho = b2 / d2
+    return float(rho / (1.0 - rho)) if rho < 1.0 else float("inf")
+
+
 def _whiten(
-    theta: Any, entry: dict[str, Any], shrinkage: float, name: str
+    theta: Any, entry: dict[str, Any], shrinkage: float | str, name: str
 ) -> dict[str, Any]:
     """Fit the whitening transform: the overall mean and ``Sigma^-1/2``.
 
@@ -551,13 +649,17 @@ def _whiten(
     # Ridge toward the identity before the root: the covariance is hidden x hidden
     # estimated from token counts that are not always comfortably larger, so the
     # small eigenvalues are noise and 1/sqrt(noise) is enormous.
-    cov.flat[:: dim + 1] += shrinkage * float(np.trace(cov)) / dim
+    lam = _lw_shrinkage(entry, name) if shrinkage == "auto" else float(shrinkage)
+    if shrinkage == "auto":
+        logger.info("Probe %r: Ledoit-Wolf shrinkage = %.4g", name, lam)
+    cov.flat[:: dim + 1] += lam * float(np.trace(cov)) / dim
 
     evals, evecs = np.linalg.eigh(cov)
     floor = max(float(evals.max()), 1e-12) * 1e-10
     whitener = (evecs * np.clip(evals, floor, None) ** -0.5) @ evecs.T
     return {
         "mean": to_numpy(entry["mean"]).astype(np.float64),
+        "shrinkage": lam,
         "cov": cov,
         "whitener": whitener,
         "theta_whitened": whitener @ np.asarray(theta, dtype=np.float64),
