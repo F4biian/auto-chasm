@@ -197,10 +197,24 @@ class Model:
         Args:
             data: Input data (list, numpy array, or tensor).
 
+        Under PyTorch the result is placed on the MODEL's device. ``forward``
+        moves its own inputs, so that path never noticed the difference — but
+        anything using this tensor directly (a custom ``steer_fn`` adding a
+        vector to the hidden states, say) got a CPU tensor and died with
+        "Expected all tensors to be on the same device".
+
         Returns:
-            A framework tensor (``mx.array`` or ``torch.Tensor``).
+            A framework tensor (``mx.array`` or ``torch.Tensor``), on the
+            model's device under PyTorch.
         """
-        return self.backend.tensor.tensor(data)
+        import contextlib
+
+        out = self.backend.tensor.tensor(data)
+        if self.backend.name == "torch":
+            # StopIteration: a model with no parameters has no device to match.
+            with contextlib.suppress(StopIteration):
+                out = out.to(next(self.model.parameters()).device)
+        return out
 
     def sample(self, logits: mx.array | torch.Tensor, temperature: float = 0.0) -> int:
         """Sample a token index from logits (backend-agnostic)."""

@@ -668,3 +668,46 @@ def test_steering_direction_survives_a_checkpoint(tmp_path: Path) -> None:
     assert hook.has_geometry and hook.config.method == "nullify"
     assert np.allclose(before, to_numpy(hook.config.direction).reshape(-1), atol=1e-5)
     assert restored.probes["L5"].whitening is not None   # and the transform came too
+
+
+def test_to_tensor_lands_on_the_models_device() -> None:
+    """A custom steer_fn adds this straight to the hidden states.
+
+    ``forward`` moves its own inputs, so a CPU result went unnoticed there — but
+    ``hidden + delta`` inside a steer_fn raised "Expected all tensors to be on
+    the same device" the moment the model was not on the CPU.
+    """
+    torch = pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch")
+    if torch.backends.mps.is_available():
+        m.model = m.model.to("mps")
+    elif torch.cuda.is_available():
+        m.model = m.model.to("cuda")
+
+    expected = next(m.model.parameters()).device
+    assert m.to_tensor(np.zeros(4, dtype=np.float32)).device == expected
+
+
+def test_a_constant_steer_fn_runs_on_the_models_device() -> None:
+    """End to end: fit, steer with a to_tensor delta, generate."""
+    torch = pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch")
+    if torch.backends.mps.is_available():
+        m.model = m.model.to("mps")
+    elif torch.cuda.is_available():
+        m.model = m.model.to("cuda")
+
+    ds = Dataset.from_conversations(conversations=_many_conversations(20),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(ds, batch_size=4, max_seq_length=128)
+
+    delta = m.to_tensor(np.asarray(res["L5"]["theta"], dtype=np.float32))
+
+    def steer(hidden: object, head: object, logits: object) -> object:
+        return hidden + delta          # the line that used to blow up
+
+    m.enable_steering("L5", steer_fn=steer)
+    assert isinstance(m.generate(prompt="Who built it?", max_tokens=4, temperature=0.0), str)
