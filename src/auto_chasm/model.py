@@ -426,6 +426,17 @@ class Model:
 
         probe = self._probes[probe_name]
 
+        # fit_mass_mean and the checkpoint hand back NumPy (float64); the steering
+        # geometry stacks BACKEND tensors and the steer fn calls backend ops. Convert
+        # once here, where the backend is known, instead of at every call site.
+        def _as_backend_vec(x: Any) -> Any:
+            if isinstance(x, np.ndarray):
+                return self.to_tensor(x.astype(np.float32))
+            return x
+
+        if hook.config.direction is not None:
+            hook.config.direction = _as_backend_vec(hook.config.direction)
+
         if steer_fn is not None:
             hook.set_custom(steer_fn)
 
@@ -437,7 +448,7 @@ class Model:
             head_weight = probe.module.weight if hasattr(probe.module, "weight") else None
             head_bias = probe.module.bias if hasattr(probe.module, "bias") else None
             if mean_0 is not None and mean_1 is not None:
-                hidden_by_class = {0: [mean_0], 1: [mean_1]}
+                hidden_by_class = {0: [_as_backend_vec(mean_0)], 1: [_as_backend_vec(mean_1)]}
                 hook.compute_geometry(hidden_by_class, head_weight, head_bias)
 
         built = build_auto_steer_fn(hook)

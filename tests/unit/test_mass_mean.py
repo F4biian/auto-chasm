@@ -604,3 +604,67 @@ def test_auto_shrinks_harder_when_data_is_scarcer() -> None:
                             batch_size=4, max_seq_length=128)
         lams.append(r["L5"]["shrinkage"])
     assert lams[0] > lams[1]
+
+
+# --- steering along a fitted mass-mean direction ------------------------------
+
+
+def test_fit_mass_mean_output_feeds_enable_steering_directly() -> None:
+    """The two APIs must compose without the caller converting types by hand.
+
+    ``fit_mass_mean`` returns NumPy; the steering geometry stacks BACKEND tensors.
+    Passing the result straight through used to raise ``expected Tensor ... but
+    got numpy.ndarray`` on both backends, which made the obvious call impossible.
+    """
+    from auto_chasm import SteeringConfig
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(60),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, batch_size=8, max_seq_length=128)
+
+    # Steer along the WHITENED direction, which is what the head already holds.
+    direction = m.probes["L5"].module.weight.reshape(-1)
+    m.enable_steering("L5",
+                      config=SteeringConfig(method="nullify", direction=direction),
+                      class_means=res)
+    assert m.steering_hooks["L5"].has_geometry
+
+
+def test_a_numpy_direction_is_accepted(fitted: tuple) -> None:
+    """A direction taken from the fit result is NumPy; it must not need casting."""
+    from auto_chasm import SteeringConfig
+
+    model, _, means = fitted
+    name = next(iter(model.probes))
+    model.enable_steering(
+        name,
+        config=SteeringConfig(method="nullify", direction=means[name]["theta"]),
+        class_means=means,
+    )
+    assert model.steering_hooks[name].has_geometry
+
+
+def test_steering_direction_survives_a_checkpoint(tmp_path: Path) -> None:
+    from auto_chasm import SteeringConfig
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(60),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, batch_size=8, max_seq_length=128)
+    m.enable_steering("L5",
+                      config=SteeringConfig(method="nullify",
+                                            direction=m.probes["L5"].module.weight.reshape(-1)),
+                      class_means=res)
+    before = to_numpy(m.steering_hooks["L5"].config.direction).reshape(-1)
+
+    m.save_checkpoint(str(tmp_path / "ck"))
+    restored = Model.from_checkpoint(str(tmp_path / "ck"),
+                                     base_model="HuggingFaceTB/SmolLM2-135M")
+
+    hook = restored.steering_hooks["L5"]
+    assert hook.has_geometry and hook.config.method == "nullify"
+    assert np.allclose(before, to_numpy(hook.config.direction).reshape(-1), atol=1e-5)
+    assert restored.probes["L5"].whitening is not None   # and the transform came too
