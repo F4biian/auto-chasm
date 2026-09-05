@@ -190,9 +190,13 @@ class MLXMassMeanHead(nn.Module):  # type: ignore[misc]
         out_features: Must be 1 -- a mass-mean direction is a single logit.
     """
 
-    def __init__(self, in_features: int, out_features: int = 1) -> None:
+    def __init__(self, in_features: int, out_features: int = 1, whiten: bool = False) -> None:
         """Build the frozen direction and the trainable scale/bias."""
         super().__init__()
+        # Underscore: a plain bool, intentionally outside the MLX parameter tree.
+        # It records how this probe WANTS to be fitted, so `fit_mass_mean` can honour
+        # the declaration instead of the caller having to repeat it at every call site.
+        self._whiten_by_default = whiten
         if out_features != 1:
             raise ValueError(
                 f"mass_mean heads are single-logit; got out_features={out_features}. "
@@ -219,6 +223,6 @@ class MLXMassMeanHead(nn.Module):  # type: ignore[misc]
         return mx.expand_dims(self.scale * (x * self.direction).sum(axis=-1) + self.bias, -1)
 
 
-def build_mlx_mass_mean(in_features: int, out_features: int) -> Any:
-    """Build the built-in ``"mass_mean"`` head on MLX."""
-    return MLXMassMeanHead(in_features, out_features)
+def build_mlx_mass_mean(in_features: int, out_features: int, whiten: bool = False) -> Any:
+    """Build the built-in ``"mass_mean"``/``"mass_mean_whiten"`` head on MLX."""
+    return MLXMassMeanHead(in_features, out_features, whiten)

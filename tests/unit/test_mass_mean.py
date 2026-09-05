@@ -320,12 +320,22 @@ def test_whitening_matches_lda_on_auroc_exactly() -> None:
     assert cos == pytest.approx(1.0, abs=1e-9)
 
 
-def test_whiten_is_off_by_default() -> None:
+def test_whiten_is_off_by_default(fitted: tuple) -> None:
+    """Not passing ``whiten`` must leave an ordinary probe unwhitened.
+
+    The default is ``None`` rather than ``False`` because it now DEFERS to each
+    probe (a ``"mass_mean_whiten"`` head opts itself in). For every other head that
+    still resolves to off, which is the guarantee this test exists for -- so it
+    asserts the behaviour, not the literal default.
+    """
     import inspect
 
-    from auto_chasm.class_means import fit_mass_mean
+    from auto_chasm.class_means import _resolve_whiten, fit_mass_mean
 
-    assert inspect.signature(fit_mass_mean).parameters["whiten"].default is False
+    assert inspect.signature(fit_mass_mean).parameters["whiten"].default is None
+    model, _, _ = fitted
+    assert not any(_resolve_whiten(model.probes, None).values())
+    assert all(p.whitening is None for p in model.probes.values())
 
 
 def test_plain_fit_leaves_no_whitening_on_the_probe(fitted: tuple) -> None:
@@ -935,3 +945,79 @@ def test_mass_mean_head_end_to_end_on_torch(tmp_path: Path) -> None:
     m2 = Model.from_checkpoint(str(ck))
     assert np.array_equal(to_numpy(m2.probes["halluc"].module.direction), before_d)
     assert not m2.probes["halluc"].module.direction.requires_grad
+
+
+def test_mass_mean_whiten_probe_whitens_without_being_told() -> None:
+    """``"mass_mean_whiten"`` carries its own fit mode.
+
+    This is the footgun the type exists to remove: declaring the whitened arm and
+    then forgetting ``whiten=True`` at the fit call used to hand back the plain
+    probe, silently, with nothing in the checkpoint to show which one you got.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean_whiten")])
+
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+
+    assert m.probes["halluc"].whitening is not None
+    d = to_numpy(m.probes["halluc"].module.direction).astype(np.float64)
+    assert np.linalg.norm(d) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_plain_mass_mean_probe_still_does_not_whiten() -> None:
+    """The declaration only opts IN; a plain ``"mass_mean"`` probe is unchanged."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    assert m.probes["halluc"].whitening is None
+
+
+def test_explicit_whiten_argument_overrides_the_declaration() -> None:
+    """An explicit ``whiten=`` still wins, so the old behaviour is always reachable."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean_whiten")])
+    m.fit_mass_mean(tr, probe_names=["halluc"], whiten=False, batch_size=4, max_seq_length=128)
+    assert m.probes["halluc"].whitening is None
+
+
+def test_whitened_and_plain_probes_fit_together_in_one_pass() -> None:
+    """Mixed declarations in a single call: each probe gets what it asked for.
+
+    The covariance is shared work, accumulated once because SOME probe needs it,
+    and applied only to the probes that declared whitening.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([
+        ProbeConfig(name="plain", layers=[5], module_type="mass_mean"),
+        ProbeConfig(name="white", layers=[5], module_type="mass_mean_whiten"),
+    ])
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+
+    assert m.probes["plain"].whitening is None
+    assert m.probes["white"].whitening is not None
+    dp = to_numpy(m.probes["plain"].module.direction).astype(np.float64)
+    dw = to_numpy(m.probes["white"].module.direction).astype(np.float64)
+    assert not np.allclose(dp, dw), "whitening must change the direction"
+
+
+def test_mass_mean_whiten_survives_the_checkpoint(tmp_path: Path) -> None:
+    """The declaration is part of ``module_type``, so a reload knows what it is."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean_whiten")])
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    before = m.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc")
+
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+    m2 = Model.from_checkpoint(str(ck))
+
+    assert m2.probes["halluc"].config.module_type == "mass_mean_whiten"
+    assert m2.probes["halluc"].module._whiten_by_default is True
+    assert m2.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc") == pytest.approx(
+        before, abs=1e-9
+    )

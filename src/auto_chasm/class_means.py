@@ -404,7 +404,7 @@ def fit_mass_mean(
     dataset: Any,
     *,
     probe_names: list[str] | None = None,
-    whiten: bool = False,
+    whiten: bool | None = None,
     shrinkage: float | str = 1e-2,
     calibrate_scale: bool = False,
     calibrate_bias: bool = False,
@@ -430,7 +430,12 @@ def fit_mass_mean(
         model: A ``Model`` with single-logit linear probes attached.
         dataset: The data to fit the means on (the TRAIN split).
         probe_names: Which probes to fit (``None`` = all attached).
-        whiten: Fit the overall mean ``mu`` and covariance ``Sigma`` of the hidden
+        whiten: ``None`` (default) asks each probe: a ``"mass_mean_whiten"`` head
+            whitens itself and every other head does not, so the choice lives with
+            the probe and cannot be lost by forgetting an argument here. ``True``/
+            ``False`` overrides that for every probe in the call.
+
+            When on: fit the overall mean ``mu`` and covariance ``Sigma`` of the hidden
             states as well, and score the WHITENED state instead of the raw one::
 
                 h_white = Sigma^-1/2 (h - mu)
@@ -492,16 +497,19 @@ def fit_mass_mean(
 
     names = list(probe_names if probe_names is not None else model.probes)
     probes = {n: model.probes[n] for n in names}
+    # Per-probe, so one pass can fit a whitened and an unwhitened probe together.
+    # The second moment is accumulated if ANY of them needs it (it is shared work).
+    wants = _resolve_whiten(probes, whiten)
     raw = compute_class_means(model, probes, dataset, model.backend.name,
                               batch_size=batch_size, max_seq_length=max_seq_length,
-                              second_moment=whiten)
+                              second_moment=any(wants.values()))
 
     out: dict[str, dict[str, Any]] = {}
     for name in names:
         m0 = to_numpy(raw[name]["mean_0"]).astype(np.float64)
         m1 = to_numpy(raw[name]["mean_1"]).astype(np.float64)
         theta = m1 - m0
-        wh = _whiten(theta, raw[name], shrinkage, name) if whiten else None
+        wh = _whiten(theta, raw[name], shrinkage, name) if wants[name] else None
         # Scoring the whitened state is still a plain linear read of the raw one:
         #   theta_w . (Sigma^-1/2 (h - mu)) == (Sigma^-1/2 theta_w) . (h - mu)
         # so the transform folds into the weight and the centering into the bias.
@@ -657,6 +665,27 @@ def _whiten(
         "whitener": whitener,
         "theta_whitened": whitener @ np.asarray(theta, dtype=np.float64),
     }
+
+
+def _resolve_whiten(probes: dict[str, Any], whiten: bool | None) -> dict[str, bool]:
+    """Decide, per probe, whether to whiten.
+
+    An explicit ``True``/``False`` applies to every probe. ``None`` (the default)
+    asks each head what it was declared as: a ``"mass_mean_whiten"`` probe whitens
+    itself, anything else does not. That keeps the declaration in one place -- the
+    ``ProbeConfig`` -- instead of requiring every ``fit_mass_mean`` call site to
+    repeat it correctly, where forgetting it silently produces the unwhitened probe.
+
+    Args:
+        probes: The probes being fitted, keyed by name.
+        whiten: The caller's override, or ``None`` to defer to each probe.
+
+    Returns:
+        ``{probe_name: whiten}``.
+    """
+    if whiten is not None:
+        return dict.fromkeys(probes, bool(whiten))
+    return {n: bool(getattr(p.module, "_whiten_by_default", False)) for n, p in probes.items()}
 
 
 def _is_mass_mean_head(module: Any) -> bool:

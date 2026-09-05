@@ -788,7 +788,7 @@ class Model:
         dataset: Any,
         *,
         probe_names: list[str] | None = None,
-        whiten: bool = False,
+        whiten: bool | None = None,
         shrinkage: float | str = 1e-2,
         calibrate_scale: bool = False,
         calibrate_bias: bool = False,
@@ -804,12 +804,17 @@ class Model:
         Args:
             dataset: Data to fit the means on (the TRAIN split).
             probe_names: Which probes (``None`` = all attached).
-            whiten: Also fit the LABEL-FREE whitening transform of the hidden
-                states, ``h_white = Sigma^-1/2 (h - mu)``, and score in that
-                space. The transform is stored on the probe (``probe.whitening``,
-                ``probe.whiten(h)``) and saved with the checkpoint. OFF by
-                default, so the probe stays the plain projection. Costs one
-                ``hidden x hidden`` matrix per probe and still runs in one pass.
+            whiten: ``None`` (default) defers to each probe: a
+                ``module_type="mass_mean_whiten"`` head whitens itself, every other
+                head does not. ``True``/``False`` overrides that for the whole call.
+
+                Whitening fits the LABEL-FREE transform of the hidden states,
+                ``h_white = Sigma^-1/2 (h - mu)``, and measures the direction in
+                that space. It is FOLDED into the head's weight and bias, so the
+                head stays a plain read of raw states; the transform itself is also
+                kept on the probe (``probe.whitening``, ``probe.whiten(h)``) and
+                saved with the checkpoint. Costs one ``hidden x hidden`` matrix per
+                probe and still runs in one pass.
             shrinkage: ``"auto"`` for the closed-form Ledoit-Wolf optimum (no
                 sweep needed), or a ridge on the covariance as a fraction of its mean
                 eigenvalue, before solving.

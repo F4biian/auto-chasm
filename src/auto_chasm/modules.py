@@ -88,23 +88,29 @@ def _build_linear(in_features: int, out_features: int, backend: str) -> Any:
     return build_mlx_linear(in_features, out_features)
 
 
-def _build_mass_mean(in_features: int, cfg: dict[str, Any], backend: str) -> Any:
-    """Build the built-in ``"mass_mean"`` head on the given backend.
+def _build_mass_mean(in_features: int, cfg: dict[str, Any], backend: str, whiten: bool) -> Any:
+    """Build the built-in ``"mass_mean"``/``"mass_mean_whiten"`` head on the backend.
 
     The head is ``scale * (h . direction) + bias`` with ``direction`` frozen. It is
     created UNFITTED (direction all-zero) and filled in by ``Model.fit_mass_mean``,
     which is what lets a mass-mean probe be declared exactly like any other head --
-    and, because ``"mass_mean"`` is a plain string rather than a user callable, be
-    recorded in the checkpoint manifest and rebuilt automatically on load.
+    and, because these are plain strings rather than user callables, be recorded in
+    the checkpoint manifest and rebuilt automatically on load.
+
+    Both names build the SAME module: whitening is folded into the fitted direction
+    and bias, so it changes which direction is written, never the architecture. The
+    ``whiten`` flag is carried on the head only so ``fit_mass_mean`` can honour what
+    the probe declared, instead of the caller having to pass ``whiten=True`` at every
+    call site and silently getting the unwhitened probe when they forget.
     """
     out_features = cfg.get("out_features", 1)
     if backend == "torch":
         from auto_chasm._torch_mlp import build_torch_mass_mean
 
-        return build_torch_mass_mean(in_features, out_features)
+        return build_torch_mass_mean(in_features, out_features, whiten)
     from auto_chasm._mlx_mlp import build_mlx_mass_mean
 
-    return build_mlx_mass_mean(in_features, out_features)
+    return build_mlx_mass_mean(in_features, out_features, whiten)
 
 
 def _build_builtin_mlp(in_features: int, cfg: dict[str, Any], backend: str) -> Any:
@@ -126,7 +132,8 @@ def build_probe_module(
 ) -> Any:
     """Build a probe's trainable head from its :class:`ProbeConfig`.
 
-    Handles the built-in ``"linear"``/``"mlp"``/``"mass_mean"`` strings, a user callable
+    Handles the built-in ``"linear"``/``"mlp"``/``"mass_mean"``/``"mass_mean_whiten"``
+    strings, a user callable
     ``(in_features, cfg) -> module`` (a :class:`ModuleSpec` or any callable),
     and the ``ProbeConfig.layer_norm`` input-normalization wrap.
 
@@ -152,12 +159,14 @@ def build_probe_module(
         inner = _build_linear(in_features, cfg.get("out_features", 1), backend_name)
     elif module_type == "mlp":
         inner = _build_builtin_mlp(in_features, cfg, backend_name)
-    elif module_type == "mass_mean":
-        inner = _build_mass_mean(in_features, cfg, backend_name)
+    elif module_type in ("mass_mean", "mass_mean_whiten"):
+        inner = _build_mass_mean(
+            in_features, cfg, backend_name, whiten=module_type == "mass_mean_whiten"
+        )
     else:
         raise ValueError(
-            f"Unknown module_type {module_type!r}. "
-            "Use 'linear', 'mlp', 'mass_mean', a ModuleSpec, or a callable."
+            f"Unknown module_type {module_type!r}. Use 'linear', 'mlp', 'mass_mean', "
+            "'mass_mean_whiten', a ModuleSpec, or a callable."
         )
 
     if config.layer_norm:

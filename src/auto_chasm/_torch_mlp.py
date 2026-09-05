@@ -166,9 +166,13 @@ class TorchMassMeanHead(nn.Module):  # type: ignore[misc]
         out_features: Must be 1 -- a mass-mean direction is a single logit.
     """
 
-    def __init__(self, in_features: int, out_features: int = 1) -> None:
+    def __init__(self, in_features: int, out_features: int = 1, whiten: bool = False) -> None:
         """Build the frozen direction buffer and the trainable scale/bias."""
         super().__init__()
+        # Records how this probe WANTS to be fitted (see the MLX head). A plain
+        # attribute: neither a parameter nor a buffer, so it never reaches the
+        # optimizer or the checkpoint -- the manifest's module_type restores it.
+        self._whiten_by_default = whiten
         if out_features != 1:
             raise ValueError(
                 f"mass_mean heads are single-logit; got out_features={out_features}. "
@@ -185,6 +189,6 @@ class TorchMassMeanHead(nn.Module):  # type: ignore[misc]
         return (self.scale * proj + self.bias).unsqueeze(-1)
 
 
-def build_torch_mass_mean(in_features: int, out_features: int) -> Any:
-    """Build the built-in ``"mass_mean"`` head on torch."""
-    return TorchMassMeanHead(in_features, out_features)
+def build_torch_mass_mean(in_features: int, out_features: int, whiten: bool = False) -> Any:
+    """Build the built-in ``"mass_mean"``/``"mass_mean_whiten"`` head on torch."""
+    return TorchMassMeanHead(in_features, out_features, whiten)
