@@ -24,7 +24,8 @@ class ProbeConfig:
 
     Probes are named, attached to specific layers, and produce outputs
     at a configurable granularity.  Built-in module types (``"linear"``,
-    ``"mlp"``) cover common cases; pass a callable for custom architectures.
+    ``"mlp"``, ``"mass_mean"``) cover common cases; pass a callable for custom
+    architectures.
 
     Attributes:
         name: Unique probe identifier (used as dict key in outputs).
@@ -43,8 +44,18 @@ class ProbeConfig:
               input hidden state).
         aggregation: How to combine multi-layer inputs
             (``"concat"``, ``"mean"``, ``"max"``, ``"last"``, or callable).
-        module_type: Built-in type name (``"linear"``, ``"mlp"``) or
-            callable ``(in_dim, cfg) -> nn.Module``.
+        module_type: Built-in type name (``"linear"``, ``"mlp"``,
+            ``"mass_mean"``) or callable ``(in_dim, cfg) -> nn.Module``.
+
+            ``"mass_mean"`` builds ``scale * (h . direction) + bias`` with the
+            direction FROZEN and only the two scalars trainable. Attach it like
+            any other head, fill the direction with
+            ``model.fit_mass_mean(train_data)``, and train it jointly with LoRA
+            as usual -- the optimizer can rescale and shift the boundary but
+            never rotate the axis. Prefer it over a hand-rolled callable: the
+            direction is saved inside the probe checkpoint and the string
+            survives the manifest, so ``Model.from_checkpoint`` restores the
+            probe with no side-car file and no rebuild code.
         module_config: Keyword arguments for the module constructor.
         granularity: Output granularity.
 

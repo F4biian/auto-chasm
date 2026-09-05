@@ -711,3 +711,188 @@ def test_a_constant_steer_fn_runs_on_the_models_device() -> None:
 
     m.enable_steering("L5", steer_fn=steer)
     assert isinstance(m.generate(prompt="Who built it?", max_tokens=4, temperature=0.0), str)
+
+
+# --- the built-in "mass_mean" head ------------------------------------------
+#
+# The same fitted direction, but attached like any other probe: declared with a
+# plain string, so it round-trips through the checkpoint manifest, and frozen, so
+# joint training can recalibrate it without rotating it.
+
+
+def _mm_model() -> tuple[Model, Dataset, Dataset]:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+    return m, tr, te
+
+
+def _trainable(module: object) -> list[str]:
+    from mlx.utils import tree_flatten
+
+    return sorted(k for k, _ in tree_flatten(module.trainable_parameters()))
+
+
+def _saved(module: object) -> list[str]:
+    from mlx.utils import tree_flatten
+
+    return sorted(k for k, _ in tree_flatten(module.parameters()))
+
+
+def test_mass_mean_head_starts_unfitted() -> None:
+    """An unfitted head scores a CONSTANT, not a random direction.
+
+    A random init would look like a working probe and quietly report noise as
+    signal; an all-zero direction is unmistakably broken.
+    """
+    m, _, _ = _mm_model()
+    assert not to_numpy(m.probes["halluc"].module.direction).any()
+
+
+def test_direction_is_saved_but_never_trainable() -> None:
+    """``direction`` must be in ``parameters()`` yet out of ``trainable_parameters()``.
+
+    The first is what the checkpoint writer walks, so a saved probe reloads
+    complete with no side-car file; the second is what the optimizer walks, so no
+    training step can rotate the axis.
+    """
+    m, _, _ = _mm_model()
+    module = m.probes["halluc"].module
+    assert _saved(module) == ["bias", "direction", "scale"]
+    assert _trainable(module) == ["bias", "scale"]
+
+
+def test_direction_survives_the_unfreeze_paths() -> None:
+    """``prepare_for_joint_training`` unfreezes every probe — the direction must resist.
+
+    ``_TrainableModel.__init__`` also calls ``probe.module.unfreeze()`` on each
+    wrapped probe, so without the head's own re-freeze the "mass-mean" probe would
+    silently become an ordinary trainable linear one the moment training started.
+    """
+    m, _, _ = _mm_model()
+    module = m.probes["halluc"].module
+    module.unfreeze()
+    assert _trainable(module) == ["bias", "scale"]
+    m.prepare_for_joint_training()
+    assert _trainable(module) == ["bias", "scale"]
+
+
+def test_fit_writes_a_unit_direction_and_moves_the_norm_into_scale() -> None:
+    """The head stores ``theta/|theta|`` with ``|theta|`` in ``scale``."""
+    m, tr, _ = _mm_model()
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    module = m.probes["halluc"].module
+    d = to_numpy(module.direction).astype(np.float64)
+    assert np.linalg.norm(d) == pytest.approx(1.0, abs=1e-5)
+    assert float(to_numpy(module.scale)) > 0.0
+
+
+def test_mass_mean_head_scores_exactly_like_the_linear_one() -> None:
+    """Swapping the head changes WHAT IS TRAINABLE, never the fitted function.
+
+    Both probes are fitted on the same data at the same layer, so their scores —
+    and therefore their AUROC — must agree; the frozen head only splits the same
+    weight into a unit direction and a scale.
+    """
+    m_lin = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m_lin)
+    m_lin.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="linear")])
+    m_lin.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+
+    m_mm, _, _ = _mm_model()
+    m_mm.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+
+    s_lin = m_lin.probe_scores(te, batch_size=4, max_seq_length=128)
+    s_mm = m_mm.probe_scores(te, batch_size=4, max_seq_length=128)
+    assert s_mm.auroc("halluc") == pytest.approx(s_lin.auroc("halluc"), abs=1e-6)
+
+
+def test_training_recalibrates_but_does_not_rotate(tmp_path: Path) -> None:
+    """Joint training moves scale/bias and leaves the direction bit-identical."""
+    from auto_chasm import JointLoss, Trainer
+
+    m, tr, te = _mm_model()
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    m.prepare_for_joint_training()
+    module = m.probes["halluc"].module
+    before_d = to_numpy(module.direction).copy()
+    before_s = float(to_numpy(module.scale))
+
+    Trainer(model=m, loss_fn=JointLoss(weights={"lm_head": 0.0, "halluc": 1.0}),
+            learning_rate=1e-2, batch_size=4, grad_accum_steps=1, num_iters=4,
+            max_seq_length=128, save_steps=0, eval_steps=0, logging_steps=4,
+            output_dir=str(tmp_path), seed=0, verbose=False).train(train_data=tr, val_data=te)
+
+    assert np.array_equal(to_numpy(module.direction), before_d)
+    assert float(to_numpy(module.scale)) != before_s
+
+
+def test_checkpoint_round_trip_needs_no_side_car(tmp_path: Path) -> None:
+    """``"mass_mean"`` is a string, so the manifest rebuilds the head on load.
+
+    A custom callable head serialises as ``"__callable__"`` and cannot be
+    reconstructed, which forces callers to persist the direction themselves and
+    rebuild by hand before loading. This is the whole reason the head is built in.
+    """
+    m, tr, te = _mm_model()
+    m.fit_mass_mean(tr, probe_names=["halluc"], whiten=True, batch_size=4, max_seq_length=128)
+    before = m.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc")
+
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+    m2 = Model.from_checkpoint(str(ck))
+
+    module = m2.probes["halluc"].module
+    assert np.array_equal(to_numpy(module.direction), to_numpy(m.probes["halluc"].module.direction))
+    assert _trainable(module) == ["bias", "scale"]
+    assert m2.probes["halluc"].whitening is not None
+    after = m2.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc")
+    assert after == pytest.approx(before, abs=1e-9)
+
+
+def test_mass_mean_head_is_single_logit() -> None:
+    """A direction is one axis; asking for more outputs is a config error."""
+    from auto_chasm.modules import build_probe_module
+
+    cfg = ProbeConfig(name="p", layers=[2], module_type="mass_mean")
+    with pytest.raises(ValueError, match="single-logit"):
+        build_probe_module(cfg, 16, {"out_features": 3}, "mlx")
+
+
+def test_mass_mean_head_is_frozen_and_saved_on_torch() -> None:
+    """Torch reaches the same two guarantees by a different mechanism than MLX.
+
+    A persistent BUFFER is in ``state_dict()`` (so the checkpoint carries the
+    direction) but not in ``parameters()`` — which is exactly what
+    ``Backend.unfreeze``'s ``requires_grad`` sweep walks, so it cannot be released.
+    """
+    torch = pytest.importorskip("torch")
+    from auto_chasm.modules import build_probe_module
+
+    cfg = ProbeConfig(name="p", layers=[2], module_type="mass_mean")
+    head = build_probe_module(cfg, 16, {"out_features": 1}, "torch")
+
+    assert sorted(n for n, _ in head.named_parameters()) == ["bias", "scale"]
+    assert "direction" in head.state_dict()
+
+    for prm in head.parameters():          # what Backend.unfreeze() does
+        prm.requires_grad = True
+    assert not head.direction.requires_grad
+
+    d = np.random.randn(16).astype(np.float32)
+    d /= np.linalg.norm(d)
+    with torch.no_grad():
+        head.direction.copy_(torch.tensor(d))
+        head.scale.copy_(torch.tensor(2.5))
+        head.bias.copy_(torch.tensor(-0.75))
+
+    x = torch.randn(2, 3, 16)
+    expected = (2.5 * (x.numpy() * d).sum(-1) - 0.75)[..., None]
+    assert np.allclose(head(x).detach().numpy(), expected, atol=1e-5)
+
+    before = head.direction.clone()
+    torch.optim.SGD(list(head.parameters()), lr=0.1).zero_grad()
+    loss = head(x).square().mean()
+    loss.backward()
+    torch.optim.SGD(list(head.parameters()), lr=0.1).step()
+    assert torch.equal(before, head.direction)

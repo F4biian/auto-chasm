@@ -88,6 +88,25 @@ def _build_linear(in_features: int, out_features: int, backend: str) -> Any:
     return build_mlx_linear(in_features, out_features)
 
 
+def _build_mass_mean(in_features: int, cfg: dict[str, Any], backend: str) -> Any:
+    """Build the built-in ``"mass_mean"`` head on the given backend.
+
+    The head is ``scale * (h . direction) + bias`` with ``direction`` frozen. It is
+    created UNFITTED (direction all-zero) and filled in by ``Model.fit_mass_mean``,
+    which is what lets a mass-mean probe be declared exactly like any other head --
+    and, because ``"mass_mean"`` is a plain string rather than a user callable, be
+    recorded in the checkpoint manifest and rebuilt automatically on load.
+    """
+    out_features = cfg.get("out_features", 1)
+    if backend == "torch":
+        from auto_chasm._torch_mlp import build_torch_mass_mean
+
+        return build_torch_mass_mean(in_features, out_features)
+    from auto_chasm._mlx_mlp import build_mlx_mass_mean
+
+    return build_mlx_mass_mean(in_features, out_features)
+
+
 def _build_builtin_mlp(in_features: int, cfg: dict[str, Any], backend: str) -> Any:
     """Build the built-in ``"mlp"`` head (``hidden_dim``/``dropout`` from ``cfg``)."""
     out_features = cfg.get("out_features", 1)
@@ -107,7 +126,7 @@ def build_probe_module(
 ) -> Any:
     """Build a probe's trainable head from its :class:`ProbeConfig`.
 
-    Handles the built-in ``"linear"``/``"mlp"`` strings, a user callable
+    Handles the built-in ``"linear"``/``"mlp"``/``"mass_mean"`` strings, a user callable
     ``(in_features, cfg) -> module`` (a :class:`ModuleSpec` or any callable),
     and the ``ProbeConfig.layer_norm`` input-normalization wrap.
 
@@ -133,10 +152,12 @@ def build_probe_module(
         inner = _build_linear(in_features, cfg.get("out_features", 1), backend_name)
     elif module_type == "mlp":
         inner = _build_builtin_mlp(in_features, cfg, backend_name)
+    elif module_type == "mass_mean":
+        inner = _build_mass_mean(in_features, cfg, backend_name)
     else:
         raise ValueError(
             f"Unknown module_type {module_type!r}. "
-            "Use 'linear', 'mlp', a ModuleSpec, or a callable."
+            "Use 'linear', 'mlp', 'mass_mean', a ModuleSpec, or a callable."
         )
 
     if config.layer_norm:

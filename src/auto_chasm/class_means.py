@@ -507,14 +507,7 @@ def fit_mass_mean(
         # so the transform folds into the weight and the centering into the bias.
         direction = wh["whitener"] @ wh["theta_whitened"] if wh else theta
         module = probes[name].module
-        weight = getattr(module, "weight", None)
-        if weight is None or tuple(weight.shape) != (1, direction.shape[0]):
-            raise ValueError(
-                f"Probe {name!r} has no single-logit linear head to write the mass-mean "
-                f"direction into (expected weight of shape (1, {direction.shape[0]}), got "
-                f"{None if weight is None else tuple(weight.shape)}). Build the sweep with "
-                "ModuleSpec.linear(out_features=1)."
-            )
+        _check_writable_head(module, name, direction.shape[0])
         scale = 1.0
         if calibrate_scale:
             spread = float(direction @ (m1 - m0))
@@ -528,7 +521,7 @@ def fit_mass_mean(
             # ZERO unless asked for: the head arrives randomly initialised, and
             # leaving that bias in place offsets every score by a constant.
             bias = 0.0
-        _write_linear(module, w, bias, model.backend.name)
+        _write_head(module, w, bias, model.backend.name)
         out[name] = {"mean_0": m0, "mean_1": m1, "theta": theta,
                      "scale": scale, "bias": bias}
         # Hang the transform off the probe so it is saved with the checkpoint and
@@ -664,6 +657,89 @@ def _whiten(
         "whitener": whitener,
         "theta_whitened": whitener @ np.asarray(theta, dtype=np.float64),
     }
+
+
+def _is_mass_mean_head(module: Any) -> bool:
+    """True for a built-in ``"mass_mean"`` head (frozen direction + scale/bias)."""
+    return hasattr(module, "direction") and hasattr(module, "scale")
+
+
+def _check_writable_head(module: Any, name: str, hidden: int) -> None:
+    """Raise unless this probe has a head the mass-mean direction can be written into.
+
+    Args:
+        module: The probe's head module.
+        name: Probe name, for the error message.
+        hidden: Expected input width.
+
+    Raises:
+        ValueError: If the head is neither a single-logit linear layer nor a
+            built-in mass-mean head.
+    """
+    if _is_mass_mean_head(module):
+        if tuple(module.direction.shape) != (hidden,):
+            raise ValueError(
+                f"Probe {name!r} has a mass_mean head of width "
+                f"{tuple(module.direction.shape)}, expected ({hidden},)."
+            )
+        return
+    weight = getattr(module, "weight", None)
+    if weight is None or tuple(weight.shape) != (1, hidden):
+        raise ValueError(
+            f"Probe {name!r} has no single-logit linear head to write the mass-mean "
+            f"direction into (expected a weight of shape (1, {hidden}), got "
+            f"{None if weight is None else tuple(weight.shape)}). Attach it with "
+            "ProbeConfig(module_type='mass_mean') for a frozen mass-mean head, or "
+            "module_type='linear' for a trainable one -- note ModuleSpec.linear() "
+            "builds a Sequential, which has no .weight to write into."
+        )
+
+
+def _write_head(module: Any, w: Any, bias: float, backend_name: str) -> None:
+    """Write the fitted direction into whichever head the probe carries.
+
+    A mass-mean head stores the UNIT direction with the magnitude moved into its
+    ``scale``, so the function it computes is identical to the linear head's
+    ``h . w + bias`` at fit time, while leaving only scale/bias trainable.
+    """
+    import numpy as np
+
+    if not _is_mass_mean_head(module):
+        _write_linear(module, w, bias, backend_name)
+        return
+    vec = np.asarray(w, dtype=np.float64).reshape(-1)
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm == 0.0:
+        raise ValueError(
+            f"fitted mass-mean direction has norm {norm}; refusing to write a "
+            "degenerate direction into the probe."
+        )
+    _write_mass_mean(module, vec / norm, norm, bias, backend_name)
+
+
+def _write_mass_mean(
+    module: Any, direction: Any, scale: float, bias: float, backend_name: str
+) -> None:
+    """Set a mass-mean head's frozen direction and its scale/bias, on either backend."""
+    import numpy as np
+
+    d = np.asarray(direction, dtype=np.float32).reshape(-1)
+    if backend_name == "mlx":
+        import mlx.core as mx
+
+        module.direction = mx.array(d)
+        module.scale = mx.array(np.float32(scale))
+        module.bias = mx.array(np.float32(bias))
+        # update() re-adds `direction` to the trainable set on some MLX versions.
+        module.freeze(recurse=False, keys=["direction"])
+        return
+    import torch
+
+    with torch.no_grad():
+        dev = module.direction.device
+        module.direction.copy_(torch.tensor(d, device=dev, dtype=module.direction.dtype))
+        module.scale.copy_(torch.tensor(scale, device=dev, dtype=module.scale.dtype))
+        module.bias.copy_(torch.tensor(bias, device=dev, dtype=module.bias.dtype))
 
 
 def _write_linear(module: Any, theta: Any, bias: float, backend_name: str) -> None:

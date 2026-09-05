@@ -163,3 +163,62 @@ def build_mlx_builtin_mlp(
 def wrap_mlx_layer_norm(inner: Any, in_features: int) -> Any:
     """Wrap ``inner`` so a ``LayerNorm(in_features)`` runs before it (MLX)."""
     return _NormThenModule(inner, in_features)
+
+
+class MLXMassMeanHead(nn.Module):  # type: ignore[misc]
+    """``logit = scale * (h . direction) + bias`` with a FROZEN direction (MLX).
+
+    The head a mass-mean probe wants: the direction is fixed by the data (see
+    :func:`auto_chasm.class_means.fit_mass_mean`) and only the two calibration
+    scalars are free, so joint training can rescale and shift the decision
+    boundary but can never rotate the axis the probe reads.
+
+    ``direction`` is a real parameter rather than a hidden attribute, so
+    ``Module.parameters()`` -- and therefore the checkpoint writer -- sees it and
+    a saved probe reloads complete, with no side-car file. It is kept FROZEN
+    instead, so ``trainable_parameters()``, which is what the optimizer reads,
+    never contains it.
+
+    ``unfreeze`` is overridden because the trainer unfreezes every probe module it
+    wraps (``_TrainableModel.__init__``) and ``Model.prepare_for_joint_training``
+    unfreezes all probes. Without re-freezing here, the direction would silently
+    become trainable the moment joint training started, and the "mass-mean" probe
+    would quietly turn into an ordinary linear one.
+
+    Args:
+        in_features: Input dimension of the hidden state being read.
+        out_features: Must be 1 -- a mass-mean direction is a single logit.
+    """
+
+    def __init__(self, in_features: int, out_features: int = 1) -> None:
+        """Build the frozen direction and the trainable scale/bias."""
+        super().__init__()
+        if out_features != 1:
+            raise ValueError(
+                f"mass_mean heads are single-logit; got out_features={out_features}. "
+                "Use module_type='linear' for a multi-output head."
+            )
+        # Zero until fitted: an unfitted mass-mean probe scores a constant, which is
+        # obviously broken, rather than a random direction that looks like a real
+        # (but meaningless) signal.
+        self.direction = mx.zeros((in_features,))
+        self.scale = mx.array(1.0)
+        self.bias = mx.array(0.0)
+        self.freeze(recurse=False, keys=["direction"])
+
+    def unfreeze(self, *args: Any, **kwargs: Any) -> Any:
+        """Unfreeze scale/bias but keep ``direction`` frozen."""
+        super().unfreeze(*args, **kwargs)
+        self.freeze(recurse=False, keys=["direction"])
+        return self
+
+    def __call__(self, x: Any) -> Any:
+        """Project onto the frozen direction, then scale and shift."""
+        # No cast: float32 direction * bf16 hidden promotes to float32, exactly as
+        # nn.Linear does for the built-in "linear" head, so both heads agree.
+        return mx.expand_dims(self.scale * (x * self.direction).sum(axis=-1) + self.bias, -1)
+
+
+def build_mlx_mass_mean(in_features: int, out_features: int) -> Any:
+    """Build the built-in ``"mass_mean"`` head on MLX."""
+    return MLXMassMeanHead(in_features, out_features)

@@ -148,3 +148,43 @@ def build_torch_builtin_mlp(
 def wrap_torch_layer_norm(inner: Any, in_features: int) -> Any:
     """Wrap ``inner`` so a ``LayerNorm(in_features)`` runs before it (torch)."""
     return _TorchNormThenModule(inner, in_features)
+
+
+class TorchMassMeanHead(nn.Module):  # type: ignore[misc]
+    """``logit = scale * (h . direction) + bias`` with a FROZEN direction (torch).
+
+    Mirrors :class:`auto_chasm._mlx_mlp.MLXMassMeanHead`; see it for the rationale.
+    Here ``direction`` is a PERSISTENT buffer, which gives both properties for
+    free: buffers appear in ``state_dict()`` (so the checkpoint carries the
+    direction) but not in ``parameters()`` (so neither the optimizer nor the
+    ``requires_grad`` sweep in ``Backend.unfreeze`` can ever touch it). Being a
+    registered buffer rather than a bare tensor attribute, it also follows
+    ``.to(device)`` onto CUDA/MPS.
+
+    Args:
+        in_features: Input dimension of the hidden state being read.
+        out_features: Must be 1 -- a mass-mean direction is a single logit.
+    """
+
+    def __init__(self, in_features: int, out_features: int = 1) -> None:
+        """Build the frozen direction buffer and the trainable scale/bias."""
+        super().__init__()
+        if out_features != 1:
+            raise ValueError(
+                f"mass_mean heads are single-logit; got out_features={out_features}. "
+                "Use module_type='linear' for a multi-output head."
+            )
+        # Zero until fitted -- see the MLX head for why not random.
+        self.register_buffer("direction", torch.zeros(in_features))
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: Any) -> Any:
+        """Project onto the frozen direction, then scale and shift."""
+        proj = (x * self.direction.to(x.dtype)).sum(dim=-1)
+        return (self.scale * proj + self.bias).unsqueeze(-1)
+
+
+def build_torch_mass_mean(in_features: int, out_features: int) -> Any:
+    """Build the built-in ``"mass_mean"`` head on torch."""
+    return TorchMassMeanHead(in_features, out_features)

@@ -369,6 +369,7 @@ from auto_chasm import ModuleSpec
 
 # 1. A built-in name — sized via module_config.
 ProbeConfig(name="p", layers=[-1], module_type="mlp", module_config={"hidden_dims": [128, 64]})
+ProbeConfig(name="p", layers=[-1], module_type="mass_mean")   # frozen direction + scale/bias
 
 # 2. A ModuleSpec — a declarative, BACKEND-AGNOSTIC head (depth, activation, dropout,
 #    layer-norm). The library builds the concrete module on whichever backend you run,
@@ -400,7 +401,7 @@ a head is just an `in_features -> out_features` module. See
 | `layers` | `list[int]` (negatives allowed) | which layer(s) the head reads; `[-1]` is the last |
 | `source` | `"hidden"` (default), `"residual"`, `"attention"`, `"mlp"`, `"embedding"`, `"logits"` | which activation to read. `hidden`/`residual`/`attention`/`mlp` are per-layer (may span several `layers`); `embedding`/`logits` read a single site (one layer) |
 | `granularity` | `"token"` (default), `"response"`, `"sentence"`, `"custom"` | one prediction per token, per whole text (mean-pooled), per sentence, or a custom pooler |
-| `module_type` | `"linear"` (default), `"mlp"`, a `ModuleSpec`, or a callable | the head architecture (see [Custom heads](#custom-heads)) |
+| `module_type` | `"linear"` (default), `"mlp"`, `"mass_mean"`, a `ModuleSpec`, or a callable | the head architecture (see [Custom heads](#custom-heads)); `"mass_mean"` is a frozen-direction head (see [Mass-mean probes](#mass-mean-probes--hidden-states)) |
 | `module_config` | `dict` | head sizing, e.g. `{"out_features": 5}` for 5 classes, or MLP `hidden_dims` |
 | `aggregation` | `"concat"` (default), `"mean"`, `"max"`, `"last"`, or a callable | how multiple `layers` combine before the head |
 | `pooling` | callable | custom time pooler for `granularity="custom"` |
@@ -881,6 +882,30 @@ Memory is O(hidden) per probe — sums stream, states are never stored — so co
 size is irrelevant, and all layers are filled from one pass. AUROC depends only on
 `theta/|theta|`, so the scale and the bias set where the threshold sits and never
 the ranking; the bias is placed so the midpoint of the two class means scores 0.
+
+**Training one jointly (`module_type="mass_mean"`).** The head above is an ordinary
+`Linear`, so nothing stops training from rotating the fitted direction away. When you
+want to keep the axis and let only the calibration move — the usual setup when a probe
+is shaping a LoRA fine-tune through a joint loss — declare the probe as `"mass_mean"`:
+
+```python
+model.add_probes([ProbeConfig(name="halluc", layers=[15], module_type="mass_mean")])
+model.fit_mass_mean(train_data, probe_names=["halluc"], whiten=True)   # fills the direction
+
+model.prepare_for_joint_training()
+Trainer(model=model, loss_fn=JointLoss(weights={"lm_head": 1.0, "halluc": 1.0}), ...).train(...)
+
+model.save_checkpoint("ckpt")
+model = Model.from_checkpoint("ckpt")        # head restored, direction and all
+```
+
+The head computes `scale * (h · direction) + bias`. `direction` is **frozen** — it is
+excluded from `trainable_parameters()` on MLX and is a buffer, not a parameter, on torch —
+so `prepare_for_joint_training()` and the trainer's own unfreeze cannot rotate it, while
+`scale`/`bias` train normally. It is still saved with the probe (a frozen MLX parameter, a
+persistent torch buffer), and because `"mass_mean"` is a plain string it survives the
+checkpoint manifest, so `from_checkpoint` rebuilds the head with no side-car file and no
+rebuild code. A custom callable head cannot do this: it serialises as `"__callable__"`.
 
 **Whitening, opt-in.** When a mass-mean probe sits far below a trained linear
 one, the usual cause is that hidden states are strongly anisotropic: `μ₁ − μ₀`
