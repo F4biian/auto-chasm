@@ -896,3 +896,42 @@ def test_mass_mean_head_is_frozen_and_saved_on_torch() -> None:
     loss.backward()
     torch.optim.SGD(list(head.parameters()), lr=0.1).step()
     assert torch.equal(before, head.direction)
+
+
+def test_mass_mean_head_end_to_end_on_torch(tmp_path: Path) -> None:
+    """Fit -> train -> save -> load on the TORCH backend, not just the head in isolation.
+
+    The torch branch of ``_write_mass_mean`` is what runs on a CUDA box; the
+    isolated head test above never reaches it. This walks the whole path the way a
+    fine-tuning script does, and checks the two invariants that matter: the fitted
+    direction is a unit vector, and training moves only the calibration.
+    """
+    pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+
+    m.fit_mass_mean(tr, probe_names=["halluc"], whiten=True, batch_size=4, max_seq_length=128)
+    module = m.probes["halluc"].module
+    d = to_numpy(module.direction).astype(np.float64)
+    assert np.linalg.norm(d) == pytest.approx(1.0, abs=1e-5)
+
+    from auto_chasm import JointLoss, Trainer
+
+    m.prepare_for_joint_training()
+    assert not module.direction.requires_grad
+    before_d, before_s = to_numpy(module.direction).copy(), float(to_numpy(module.scale))
+    Trainer(model=m, loss_fn=JointLoss(weights={"lm_head": 0.0, "halluc": 1.0}),
+            learning_rate=1e-2, batch_size=4, grad_accum_steps=1, num_iters=4,
+            max_seq_length=128, save_steps=0, eval_steps=0, logging_steps=4,
+            output_dir=str(tmp_path / "run"), seed=0, verbose=False).train(
+                train_data=tr, val_data=te)
+    assert np.array_equal(to_numpy(module.direction), before_d)
+    assert float(to_numpy(module.scale)) != before_s
+
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+    m2 = Model.from_checkpoint(str(ck))
+    assert np.array_equal(to_numpy(m2.probes["halluc"].module.direction), before_d)
+    assert not m2.probes["halluc"].module.direction.requires_grad
