@@ -136,6 +136,7 @@ def save_checkpoint(model: Model, path: str) -> None:
         "auto_chasm_version": "0.1.0",
         "backend": model.backend.name,
         "base_model": getattr(model, "_base_model_name", None),
+        "dtype": _model_dtype(model),
         "probes": {},
         "steering": {},
     }
@@ -307,11 +308,34 @@ def _save_adapters(model: Model, path: Path) -> None:
         logger.warning("Could not save adapters: %s", e)
 
 
+def _model_dtype(model: Any) -> str | None:
+    """The base model's parameter dtype as a plain name, e.g. ``"bfloat16"``.
+
+    Recorded so a checkpoint reloads in the precision it was TRAINED in. Without
+    it, ``load_checkpoint`` fell back to the loader default -- float32 on torch --
+    which silently doubled memory and changed the numerics against training.
+
+    Returns:
+        The dtype name, or ``None`` if it cannot be determined (an older
+        checkpoint, or a backend that does not expose one).
+    """
+    try:
+        if model.backend.name == "torch":
+            return str(next(model.model.parameters()).dtype).replace("torch.", "")
+        from mlx.utils import tree_flatten
+
+        params = tree_flatten(model.model.parameters())
+        return str(params[0][1].dtype).replace("mlx.core.", "") if params else None
+    except Exception:  # never let bookkeeping break a checkpoint save
+        return None
+
+
 def load_checkpoint(
     path: str,
     base_model: str | None = None,
     load_steering: bool = True,
     backend_name: str | None = None,
+    **kwargs: Any,
 ) -> Model:
     """Load a model from a checkpoint directory.
 
@@ -324,6 +348,9 @@ def load_checkpoint(
         base_model: Override base model name.
         load_steering: Whether to restore steering data.
         backend_name: ``"mlx"`` or ``"torch"``.
+        **kwargs: Passed to ``Model.from_pretrained`` (e.g. ``dtype``). By default
+            ``dtype`` comes from the manifest, so the model reloads in the precision
+            it was trained in; pass one here to override.
 
     Returns:
         A fully restored ``Model`` instance.
@@ -364,7 +391,11 @@ def load_checkpoint(
 
     from auto_chasm.backends.loaders import resolve_backend_name
 
-    model = Model.from_pretrained(model_name, backend_name=resolve_backend_name(backend_name))
+    if "dtype" not in kwargs and manifest.get("dtype"):
+        kwargs["dtype"] = manifest["dtype"]
+    model = Model.from_pretrained(
+        model_name, backend_name=resolve_backend_name(backend_name), **kwargs
+    )
     model._base_model_name = model_name  # type: ignore[attr-defined]
 
     # Apply LoRA only when the manifest recorded a real LoRA config. Keying on

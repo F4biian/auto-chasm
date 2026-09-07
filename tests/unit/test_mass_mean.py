@@ -1021,3 +1021,65 @@ def test_mass_mean_whiten_survives_the_checkpoint(tmp_path: Path) -> None:
     assert m2.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc") == pytest.approx(
         before, abs=1e-9
     )
+
+
+def test_checkpoint_reloads_in_the_dtype_it_was_saved_in(tmp_path: Path) -> None:
+    """A checkpoint must not silently come back in a different precision.
+
+    ``load_checkpoint`` used to call ``from_pretrained`` with no dtype, so a model
+    trained in bf16 reloaded at the loader default -- float32 on torch -- doubling
+    memory and changing the numerics against training. The dtype is now recorded in
+    the manifest and reapplied on load.
+    """
+    import json
+
+    import mlx.core as mx
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", dtype="bfloat16")
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+
+    with open(ck / "manifest.json") as fh:
+        assert json.load(fh)["dtype"] == "bfloat16"
+
+    from mlx.utils import tree_flatten
+
+    m2 = Model.from_checkpoint(str(ck))
+    assert tree_flatten(m2.model.parameters())[0][1].dtype == mx.bfloat16
+
+
+def test_explicit_dtype_overrides_the_manifest_on_torch(tmp_path: Path) -> None:
+    """An explicit dtype wins over the manifest, so the recorded value is a default.
+
+    Torch-only on purpose: the MLX loader drops ``dtype`` entirely (mlx_lm has no
+    such argument and its ports are already bf16), so there is nothing to override
+    there. Torch is also where the original bug bit -- its default is float32.
+    """
+    torch = pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch",
+                              dtype="bfloat16")
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+
+    assert next(Model.from_checkpoint(str(ck)).model.parameters()).dtype == torch.bfloat16
+    m2 = Model.from_checkpoint(str(ck), dtype="float32")
+    assert next(m2.model.parameters()).dtype == torch.float32
+
+
+def test_checkpoint_without_a_recorded_dtype_still_loads(tmp_path: Path) -> None:
+    """Checkpoints written before the dtype was recorded must keep loading."""
+    import json
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", dtype="bfloat16")
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+
+    with open(ck / "manifest.json") as fh:
+        manifest = json.load(fh)
+    del manifest["dtype"]                       # emulate an older checkpoint
+    with open(ck / "manifest.json", "w") as fh:
+        json.dump(manifest, fh)
+
+    assert Model.from_checkpoint(str(ck)) is not None

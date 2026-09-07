@@ -668,6 +668,7 @@ class Model:
         base_model: str | None = None,
         load_steering: bool = True,
         backend_name: Literal["mlx", "torch"] | None = None,
+        **kwargs: Any,
     ) -> Model:
         """Load a fully restored model from a checkpoint directory.
 
@@ -676,6 +677,9 @@ class Model:
             base_model: Override base model name.
             load_steering: Whether to restore steering geometry.
             backend_name: ``"mlx"`` or ``"torch"``.
+            **kwargs: Passed to ``from_pretrained`` (e.g. ``dtype``). ``dtype``
+                defaults to the one recorded in the checkpoint manifest, so the
+                model reloads in the precision it was trained in.
 
         Returns:
             A fully restored ``Model``.
@@ -687,6 +691,7 @@ class Model:
             base_model=base_model,
             load_steering=load_steering,
             backend_name=backend_name,
+            **kwargs,
         )
 
     def compute_class_means(
