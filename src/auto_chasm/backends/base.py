@@ -7,6 +7,7 @@ and model wrapping (LoRA / adapters).
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -97,6 +98,15 @@ class ModuleOps(Protocol):
 
     def train(self, module: Any) -> None:
         """Set module to training mode."""
+        ...
+
+    def no_grad(self) -> AbstractContextManager[Any]:
+        """Return a context manager that disables gradient tracking.
+
+        A forward run for READING (scoring probes, collecting hidden states) needs
+        no autograd graph. Backends that build one implicitly must switch it off
+        here; backends that do not may return a no-op context.
+        """
         ...
 
 

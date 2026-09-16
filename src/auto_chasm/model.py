@@ -849,6 +849,7 @@ class Model:
         seed: int = 0,
         batch_size: int = 8,
         max_seq_length: int = 1024,
+        no_grad: bool = True,
     ) -> Any:
         """Per-token hidden states at ``layers``, subsampled to bound memory.
 
@@ -859,6 +860,8 @@ class Model:
             seed: Sampling seed.
             batch_size: Batch size for the forward passes.
             max_seq_length: Truncation length.
+            no_grad: Run the forward passes without building an autograd graph
+                (default). Set ``False`` only to backpropagate through them.
 
         Returns:
             A ``HiddenStates`` with ``.states``, ``.labels``, ``.groups`` and a
@@ -868,7 +871,7 @@ class Model:
 
         return collect_hidden_states(
             self, dataset, layers=layers, max_tokens=max_tokens, seed=seed,
-            batch_size=batch_size, max_seq_length=max_seq_length,
+            batch_size=batch_size, max_seq_length=max_seq_length, no_grad=no_grad,
         )
 
     def probe_scores(
@@ -878,6 +881,7 @@ class Model:
         probe_names: list[str] | None = None,
         batch_size: int = 8,
         max_seq_length: int = 1024,
+        no_grad: bool = True,
     ) -> ProbeScores:
         """Per-token scores + labels for every attached probe, from ONE pass.
 
@@ -893,6 +897,8 @@ class Model:
             probe_names: Which probes (``None`` = all attached).
             batch_size: Batch size for the forward passes.
             max_seq_length: Truncation length, as in training.
+            no_grad: Run the forward passes without building an autograd graph
+                (default). Set ``False`` only to backpropagate through them.
 
         Returns:
             A ``ProbeScores`` with ``.auroc()``, ``.bootstrap()``, ``.to_csv()``.
@@ -901,7 +907,7 @@ class Model:
 
         return collect_probe_scores(
             self, dataset, probe_names=probe_names,
-            batch_size=batch_size, max_seq_length=max_seq_length,
+            batch_size=batch_size, max_seq_length=max_seq_length, no_grad=no_grad,
         )
 
     def enable_gradient_checkpointing(self) -> int:

@@ -173,6 +173,17 @@ class TorchModuleOps:
         """Set module to train mode."""
         module.train()
 
+    def no_grad(self) -> Any:
+        """Return ``torch.no_grad()``.
+
+        PyTorch records a graph whenever any leaf requires grad, which a LoRA
+        checkpoint always has, so an inference-only pass would keep every
+        activation for a backward that never comes. ``module.eval()`` does NOT
+        cover this: it switches dropout and BatchNorm, not graph building.
+        """
+        import torch
+
+        return torch.no_grad()
 
 class TorchOptimOps:
     """Optimizer operations for PyTorch."""

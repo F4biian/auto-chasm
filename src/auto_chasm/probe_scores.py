@@ -21,6 +21,7 @@ one is what a confidence interval is around.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
@@ -337,6 +338,7 @@ def collect_probe_scores(
     probe_names: list[str] | None = None,
     batch_size: int = 8,
     max_seq_length: int = 1024,
+    no_grad: bool = True,
 ) -> ProbeScores:
     """Score every token of ``dataset`` with each attached probe, in ONE pass.
 
@@ -352,6 +354,8 @@ def collect_probe_scores(
         probe_names: Which probes to score (``None`` = all attached).
         batch_size: Batch size for the forward passes.
         max_seq_length: Truncation length, as in training.
+        no_grad: Run the forward passes without building an autograd graph
+            (default). Set ``False`` only to backpropagate through them.
 
     Returns:
         A :class:`ProbeScores` holding one score per token per probe, the labels,
@@ -384,21 +388,26 @@ def collect_probe_scores(
     label_chunks: list[np.ndarray] = []
     group_chunks: list[np.ndarray] = []
 
-    for _tok_arr, y, keep, gids in _iter_masked_batches(
-        model, samples, names, batch_size, max_seq_length
-    ):
-        for n in names:
-            logits = to_numpy(model.probes[n].forward())
-            if logits.ndim == 3 and logits.shape[-1] == 1:
-                logits = logits[..., 0]
-            if logits.shape != y.shape:
-                raise ValueError(
-                    f"Probe {n!r} produced {logits.shape} for a [B, T] target — per-token "
-                    "scoring needs a single-logit, token-granularity head."
-                )
-            chunks[n].append(logits[keep])
-        label_chunks.append(y[keep])
-        group_chunks.append(np.repeat(gids, keep.sum(axis=1)))
+    # A forward run for READING needs no autograd graph. PyTorch records one
+    # whenever a parameter requires grad -- a LoRA checkpoint always has some --
+    # and the retained activations dwarf the weights. eval() does not cover this.
+    ctx = model.backend.module.no_grad() if no_grad else nullcontext()
+    with ctx:
+        for _tok_arr, y, keep, gids in _iter_masked_batches(
+            model, samples, names, batch_size, max_seq_length
+        ):
+            for n in names:
+                logits = to_numpy(model.probes[n].forward())
+                if logits.ndim == 3 and logits.shape[-1] == 1:
+                    logits = logits[..., 0]
+                if logits.shape != y.shape:
+                    raise ValueError(
+                        f"Probe {n!r} produced {logits.shape} for a [B, T] target — per-token "
+                        "scoring needs a single-logit, token-granularity head."
+                    )
+                chunks[n].append(logits[keep])
+            label_chunks.append(y[keep])
+            group_chunks.append(np.repeat(gids, keep.sum(axis=1)))
 
     if not label_chunks:
         raise ValueError("No labeled tokens found — every position was masked or padding.")
@@ -451,13 +460,15 @@ def collect_hidden_states(
     seed: int = 0,
     batch_size: int = 8,
     max_seq_length: int = 1024,
+    no_grad: bool = True,
 ) -> HiddenStates:
     """Per-token hidden states at ``layers``, SUBSAMPLED to bound memory.
 
     A corpus of ~78k labeled tokens across 24 layers at 896 dims is ~6.7 GB kept
     whole, and a scatter of millions of points is unreadable anyway. Sampling
     happens DURING the pass, so peak memory is set by ``max_tokens`` rather than by
-    corpus size.
+    corpus size. The pass runs under ``no_grad`` by default, without which a
+    checkpoint's retained activations would dominate that budget.
 
     Capture happens through attached probes, so one must exist at each requested
     layer — attaching temporary ones is not possible to undo cleanly (there is no
@@ -473,6 +484,8 @@ def collect_hidden_states(
         seed: Sampling seed.
         batch_size: Batch size for the forward passes.
         max_seq_length: Truncation length.
+        no_grad: Run the forward passes without building an autograd graph
+            (default). Set ``False`` only to backpropagate through them.
 
     Returns:
         A :class:`HiddenStates` with one row per retained token.
@@ -511,24 +524,29 @@ def collect_hidden_states(
     n_seen = 0
     n_kept = 0
 
-    for _tok, y, keep, gids in _iter_masked_batches(
-        model, samples, label_probe, batch_size, max_seq_length
-    ):
-        n_here = int(keep.sum())
-        n_seen += n_here
-        take = np.arange(n_here)
-        if max_tokens is not None:
-            budget = max_tokens - n_kept
-            if budget <= 0:
-                break
-            if n_here > budget:
-                take = rng.choice(n_here, size=budget, replace=False)
-        for layer in layers:
-            h = to_numpy(model.probes[at_layer[layer]].get_captured_states()[0])
-            kept[layer].append(h[keep][take])
-        kept_y.append(y[keep][take])
-        kept_g.append(np.repeat(gids, keep.sum(axis=1))[take])
-        n_kept += len(take)
+    # A forward run for READING needs no autograd graph. PyTorch records one
+    # whenever a parameter requires grad -- a LoRA checkpoint always has some --
+    # and the retained activations dwarf the weights. eval() does not cover this.
+    ctx = model.backend.module.no_grad() if no_grad else nullcontext()
+    with ctx:
+        for _tok, y, keep, gids in _iter_masked_batches(
+            model, samples, label_probe, batch_size, max_seq_length
+        ):
+            n_here = int(keep.sum())
+            n_seen += n_here
+            take = np.arange(n_here)
+            if max_tokens is not None:
+                budget = max_tokens - n_kept
+                if budget <= 0:
+                    break
+                if n_here > budget:
+                    take = rng.choice(n_here, size=budget, replace=False)
+            for layer in layers:
+                h = to_numpy(model.probes[at_layer[layer]].get_captured_states()[0])
+                kept[layer].append(h[keep][take])
+            kept_y.append(y[keep][take])
+            kept_g.append(np.repeat(gids, keep.sum(axis=1))[take])
+            n_kept += len(take)
 
     if not kept_y:
         raise ValueError("No labeled tokens found — every position was masked or padding.")
@@ -585,6 +603,7 @@ def evaluate_probes(
     cluster: bool = True,
     batch_size: int = 8,
     max_seq_length: int = 1024,
+    no_grad: bool = True,
 ) -> ProbeReport:
     """Score every probe on every split and build one comparable per-probe table.
 
@@ -604,6 +623,8 @@ def evaluate_probes(
         cluster: Resample groups rather than tokens (see :meth:`ProbeScores.bootstrap`).
         batch_size: Batch size for the forward passes.
         max_seq_length: Truncation length.
+        no_grad: Run the forward passes without building an autograd graph
+            (default). Set ``False`` only to backpropagate through them.
 
     Returns:
         A :class:`ProbeReport` with ``{split}_loss/_acc/_macro_f1/_auroc`` per
@@ -623,7 +644,7 @@ def evaluate_probes(
     for split_name, dataset in splits.items():
         scores = collect_probe_scores(
             model, dataset, probe_names=names,
-            batch_size=batch_size, max_seq_length=max_seq_length,
+            batch_size=batch_size, max_seq_length=max_seq_length, no_grad=no_grad,
         )
         collected[split_name] = scores
         intervals = (

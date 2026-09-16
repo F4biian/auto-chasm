@@ -6,6 +6,7 @@ for LoRA integration.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import mlx.core as mx
@@ -218,6 +219,14 @@ class MLXModuleOps:
         """Set module to training mode."""
         module.train()
 
+    def no_grad(self) -> Any:
+        """Return a no-op context: MLX never records a graph implicitly.
+
+        Gradients come from an explicit ``mx.grad`` / ``mx.value_and_grad``
+        transformation, so a plain forward allocates nothing to switch off. The
+        context exists so the same caller code runs unchanged on both backends.
+        """
+        return nullcontext()
 
 class MLXOptimOps:
     """Optimizer operations for MLX."""

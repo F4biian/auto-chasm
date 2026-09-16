@@ -28,6 +28,7 @@ EXPECTED_PUBLIC = {
     "ModuleSpec",
     "Probe",
     "ops",
+    "no_grad",
     "classification_metrics",
     "regression_metrics",
     "GenerationConfig",

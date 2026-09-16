@@ -23,6 +23,7 @@ from auto_chasm.config import (
     TrainingConfig,
 )
 from auto_chasm.dataset import Dataset
+from auto_chasm.grad import no_grad
 from auto_chasm.metrics import classification_metrics, regression_metrics
 from auto_chasm.model import Model
 from auto_chasm.modules import ModuleSpec
@@ -50,6 +51,7 @@ __all__ = [
     "ModuleSpec",
     "Probe",
     "ops",
+    "no_grad",
     # Metrics
     "classification_metrics",
     "regression_metrics",
