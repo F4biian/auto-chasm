@@ -1,0 +1,1085 @@
+"""Mass-mean probing: fit a direction with no training, reuse every scoring tool.
+
+``theta = mean_1 - mean_0`` is written INTO each linear head, so a mass-mean probe
+is just a linear probe whose weights were computed rather than learned — and
+``probe_scores``, its clustered bootstrap and the CSV all work on it unchanged.
+AUROC depends only on ``theta/|theta|``, so scale and bias set the threshold and
+never the ranking.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from auto_chasm import Dataset, Model, ProbeConfig
+from auto_chasm.metrics import auroc, to_numpy
+
+
+def _data(model: Model) -> tuple[Dataset, Dataset]:
+    convos, groups = [], []
+    for p in range(20):
+        for r in range(2):
+            dirty = (p + r) % 2 == 0
+            convos.append([
+                {"role": "user", "content": f"Who invented {p}?"},
+                {"role": "assistant",
+                 "content": "It was Nikola Tesla." if dirty else "It was Bell.",
+                 "labels": {"halluc": [{"start": 7, "end": 19, "label": 1}] if dirty else []}},
+            ])
+            groups.append(p)
+    d = Dataset.from_conversations(conversations=convos, tokenizer=model.tokenizer,
+                                   default_label=0, groups=groups)
+    return d.split(val_fraction=0.4, seed=0, groups="group")
+
+
+@pytest.fixture(scope="module")
+def fitted() -> tuple[Model, Dataset, dict]:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name=f"L{i}", layers=[i], module_config={"out_features": 1})
+                  for i in (2, 5)])
+    means = m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    return m, te, means
+
+
+def test_default_is_the_plain_projection(fitted: tuple) -> None:
+    """By default a mass-mean probe IS ``h . theta`` — no scale, no bias.
+
+    The head arrives randomly initialised, so the bias must be actively ZEROED;
+    leaving it would offset every score by an arbitrary constant.
+    """
+    m, _, means = fitted
+    w = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
+    assert np.allclose(w, means["L5"]["theta"], rtol=1e-4, atol=1e-3)
+    assert float(to_numpy(m.probes["L5"].module.bias)[0]) == pytest.approx(0.0, abs=1e-6)
+    assert means["L5"]["scale"] == 1.0 and means["L5"]["bias"] == 0.0
+
+
+def test_theta_is_the_difference_of_class_means(fitted: tuple) -> None:
+    _, _, means = fitted
+    r = means["L2"]
+    assert np.allclose(r["theta"], r["mean_1"] - r["mean_0"])
+
+
+def test_every_probe_is_fitted_from_one_pass(fitted: tuple) -> None:
+    _, _, means = fitted
+    assert sorted(means) == ["L2", "L5"]
+    assert not np.allclose(means["L2"]["theta"], means["L5"]["theta"])
+
+
+def test_scores_flow_through_the_normal_tooling(fitted: tuple) -> None:
+    m, te, _ = fitted
+    ps = m.probe_scores(te, batch_size=4, max_seq_length=128)
+    assert sorted(ps.scores) == ["L2", "L5"]
+    for value in ps.aurocs().values():
+        assert 0.0 <= value <= 1.0
+
+
+def test_auroc_ignores_scale_and_bias(fitted: tuple) -> None:
+    """Why the bias choice is free: only theta's DIRECTION can change the ranking."""
+    m, te, _ = fitted
+    ps = m.probe_scores(te, batch_size=4, max_seq_length=128)
+    s, y = ps.scores["L5"], ps.labels
+    ones = np.ones_like(y, dtype=bool)
+    base = auroc(s, y, ones)
+    assert auroc(s * 7.5 + 3.0, y, ones) == pytest.approx(base)
+
+
+def test_non_linear_head_is_rejected(fitted: tuple) -> None:
+    """An MLP head has nowhere to put a direction; say so instead of guessing."""
+    from auto_chasm import ModuleSpec
+
+    m2 = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m2)
+    m2.add_probes([ProbeConfig(name="M", layers=[2],
+                               module_type=ModuleSpec.mlp(hidden_dims=(8,), out_features=1),
+                               module_config={"out_features": 1})])
+    with pytest.raises(ValueError, match="single-logit linear head"):
+        m2.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+
+
+# --- hidden states ----------------------------------------------------------
+
+
+def test_hidden_states_are_capped(fitted: tuple) -> None:
+    m, te, _ = fitted
+    hs = m.hidden_states(te, layers=[5], max_tokens=25, batch_size=4, max_seq_length=128)
+    assert len(hs) == 25
+    assert hs.n_seen > 25                    # it really did subsample
+    assert hs.states[5].shape == (25, m.hidden_size)
+
+
+def test_hidden_states_align_with_labels_and_groups(fitted: tuple) -> None:
+    m, te, _ = fitted
+    hs = m.hidden_states(te, layers=[2, 5], max_tokens=30, batch_size=4, max_seq_length=128)
+    assert sorted(hs.states) == [2, 5]
+    for arr in (*hs.states.values(), hs.labels, hs.groups):
+        assert arr.shape[0] == len(hs)
+
+
+def test_hidden_states_class_means_helper(fitted: tuple) -> None:
+    m, te, _ = fitted
+    hs = m.hidden_states(te, layers=[5], max_tokens=None, batch_size=4, max_seq_length=128)
+    cm = hs.class_means(5)
+    h = hs.states[5]
+    assert np.allclose(cm["mean_1"], h[hs.labels == 1].mean(axis=0))
+    assert np.allclose(cm["theta"], cm["mean_1"] - cm["mean_0"])
+
+
+def test_hidden_states_needs_a_probe_at_that_layer(fitted: tuple) -> None:
+    m, te, _ = fitted
+    with pytest.raises(ValueError, match="No probe is attached at layer"):
+        m.hidden_states(te, layers=[17], batch_size=4, max_seq_length=128)
+
+
+def test_hidden_states_without_any_probe_explains_how() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    with pytest.raises(ValueError, match="No single-layer probes attached"):
+        m.hidden_states(tr, batch_size=2, max_seq_length=128)
+
+
+# --- the comparable per-probe table -----------------------------------------
+
+
+def test_metrics_covers_the_headline_four(fitted: tuple) -> None:
+    m, te, _ = fitted
+    ps = m.probe_scores(te, batch_size=4, max_seq_length=128)
+    got = ps.metrics("L5")
+    assert set(got) == {"loss", "acc", "macro_f1", "auroc"}
+    assert 0.0 <= got["acc"] <= 1.0
+    assert got["auroc"] == pytest.approx(ps.auroc("L5"))
+
+
+def test_calibration_changes_loss_but_never_auroc() -> None:
+    """The point of AUROC here: invariant to any positive rescale and shift.
+
+    So the opt-in knobs can only move ``loss`` (and, via the bias, the threshold
+    metrics) -- never the layer ranking the experiment is about.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    raw = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
+    m.fit_mass_mean(tr, calibrate_scale=True, batch_size=4, max_seq_length=128)
+    scaled = m.probe_scores(te, batch_size=4, max_seq_length=128).metrics("L5")
+
+    assert scaled["loss"] < raw["loss"] / 10.0
+    assert scaled["auroc"] == pytest.approx(raw["auroc"])
+    assert scaled["acc"] == pytest.approx(raw["acc"])     # threshold is still 0
+
+
+def test_calibrated_class_means_land_near_plus_minus_two(fitted: tuple) -> None:
+    m, _, _ = fitted
+    means = m.fit_mass_mean(_data(m)[0], calibrate_scale=True, calibrate_bias=True,
+                            batch_size=4, max_seq_length=128)
+    r = means["L5"]
+    w, b = r["theta"] * r["scale"], r["bias"]
+    assert float(w @ r["mean_1"] + b) == pytest.approx(2.0, abs=1e-3)
+    assert float(w @ r["mean_0"] + b) == pytest.approx(-2.0, abs=1e-3)
+
+
+def test_report_merges_every_split_into_one_row(fitted: tuple) -> None:
+    m, te, _ = fitted
+    tr, _ = _data(m)
+    rep = m.evaluate_probes({"val": tr, "test": te}, n_boot=30, seed=0,
+                            batch_size=4, max_seq_length=128)
+    row = rep.rows["L5"]
+    assert row["layer"] == 5
+    for split in ("val", "test"):
+        for metric in ("loss", "acc", "macro_f1", "auroc", "auroc_lo", "auroc_hi"):
+            assert f"{split}_{metric}" in row
+
+
+def test_report_csv_has_probe_and_layer_first(fitted: tuple) -> None:
+    import csv
+    import tempfile
+    from pathlib import Path
+
+    m, te, _ = fitted
+    rep = m.evaluate_probes({"test": te}, n_boot=0, batch_size=4, max_seq_length=128)
+    path = Path(tempfile.mkdtemp()) / "rep.csv"
+    rep.to_csv(str(path))
+    header = next(iter(csv.reader(path.open())))
+    assert header[:2] == ["probe", "layer"]
+    assert "test_auroc" in header
+
+
+def test_report_can_skip_bootstrapping(fitted: tuple) -> None:
+    """n_boot=0 for a quick pass: metrics without paying for intervals."""
+    m, te, _ = fitted
+    rep = m.evaluate_probes({"test": te}, n_boot=0, batch_size=4, max_seq_length=128)
+    assert "test_auroc" in rep.rows["L5"]
+    assert "test_auroc_lo" not in rep.rows["L5"]
+
+
+def test_report_keeps_the_scores_it_built_from(fitted: tuple) -> None:
+    """Discarding them meant probe_scores() repeated the whole forward pass.
+
+    One pass per split is all the table needs; the raw per-token scores fall out
+    of it for free, and re-running them for a CSV or a plot is pure waste.
+    """
+    m, te, _ = fitted
+    tr, _ = _data(m)
+    rep = m.evaluate_probes({"val": tr, "test": te}, n_boot=20, seed=0,
+                            batch_size=4, max_seq_length=128)
+    assert sorted(rep.scores) == ["test", "val"]
+    kept = rep.scores["test"]
+    assert kept.auroc("L5") == pytest.approx(rep.rows["L5"]["test_auroc"])
+    assert len(kept) > 0
+
+
+def test_report_runs_one_pass_per_split(fitted: tuple) -> None:
+    import auto_chasm.probe_scores as ps_mod
+
+    m, te, _ = fitted
+    tr, _ = _data(m)
+    calls = []
+    original = ps_mod.collect_probe_scores
+    ps_mod.collect_probe_scores = lambda *a, **k: (calls.append(1), original(*a, **k))[1]
+    try:
+        m.evaluate_probes({"val": tr, "test": te}, n_boot=0,
+                          batch_size=4, max_seq_length=128)
+    finally:
+        ps_mod.collect_probe_scores = original
+    assert len(calls) == 2
+
+
+# --- label-free whitening ---------------------------------------------------
+
+
+def test_whitening_recovers_a_direction_a_plain_projection_cannot() -> None:
+    """The mechanism, on data built to have exactly that structure.
+
+    Hidden states are strongly anisotropic, so ``mu_1 - mu_0`` picks up whatever
+    high-variance nuisance direction lies between the centroids. A plain
+    projection cannot discount it; whitening the states can. Note the transform
+    itself never sees ``y`` -- only the direction does.
+    """
+    rng = np.random.default_rng(0)
+    dim, n = 60, 8000
+    mixing = rng.normal(0, 1, (dim, dim))
+    mixing[:, 0] *= 12                       # a dominant nuisance direction
+    y = rng.integers(0, 2, n)
+    signal = np.zeros(dim)
+    signal[3] = 1.0                          # the true class axis, low variance
+    x = rng.normal(0, 1, (n, dim)) @ mixing.T + y[:, None] * signal * 6.0
+    tr, te = slice(0, n // 2), slice(n // 2, None)
+
+    xtr, ytr = x[tr], y[tr]
+    theta = xtr[ytr == 1].mean(0) - xtr[ytr == 0].mean(0)
+    mu = xtr.mean(0)                                        # label-free
+    cov = (xtr - mu).T @ (xtr - mu) / (len(xtr) - 1)        # label-free
+    cov.flat[:: dim + 1] += 1e-3 * np.trace(cov) / dim
+    evals, evecs = np.linalg.eigh(cov)
+    whitener = (evecs * evals**-0.5) @ evecs.T
+
+    ones = np.ones(n - n // 2, dtype=bool)
+    plain = auroc(x[te] @ theta, y[te], ones)
+    whitened = auroc((x[te] - mu) @ whitener.T @ (whitener @ theta), y[te], ones)
+    assert plain < 0.65
+    assert whitened > 0.90
+
+
+def test_whitening_matches_lda_on_auroc_exactly() -> None:
+    """Two-class LDA and label-free whitening give the SAME ranking.
+
+    ``S_total = S_within + (n0 n1 / n) theta theta^T`` -- the between-class term
+    is rank one ALONG theta -- so by Sherman-Morrison ``Sigma_t^-1 theta`` is a
+    POSITIVE multiple of ``Sigma_w^-1 theta``. Same direction, different length,
+    and AUROC reads only the ranking. This is why the label-free transform costs
+    nothing in AUROC while still applying to unlabelled states.
+    """
+    rng = np.random.default_rng(0)
+    dim, n = 40, 6000
+    mixing = rng.normal(0, 1, (dim, dim))
+    mixing[:, 0] *= 12
+    y = (rng.random(n) < 0.166).astype(int)          # imbalanced, as in real data
+    signal = np.zeros(dim)
+    signal[3] = 1.0
+    x = rng.normal(0, 1, (n, dim)) @ mixing.T + y[:, None] * signal * 6.0
+
+    m0, m1 = x[y == 0].mean(0), x[y == 1].mean(0)
+    theta = m1 - m0
+    mu = x.mean(0)
+    s_total = (x - mu).T @ (x - mu)
+    s_within = ((x[y == 0] - m0).T @ (x[y == 0] - m0)
+                + (x[y == 1] - m1).T @ (x[y == 1] - m1))
+
+    n0, n1 = float((y == 0).sum()), float((y == 1).sum())
+    assert np.allclose(s_total - s_within, (n0 * n1 / n) * np.outer(theta, theta))
+
+    free = np.linalg.solve(s_total, theta)
+    lda = np.linalg.solve(s_within, theta)
+    cos = free @ lda / (np.linalg.norm(free) * np.linalg.norm(lda))
+    assert cos == pytest.approx(1.0, abs=1e-9)
+
+
+def test_whiten_is_off_by_default(fitted: tuple) -> None:
+    """Not passing ``whiten`` must leave an ordinary probe unwhitened.
+
+    The default is ``None`` rather than ``False`` because it now DEFERS to each
+    probe (a ``"mass_mean_whiten"`` head opts itself in). For every other head that
+    still resolves to off, which is the guarantee this test exists for -- so it
+    asserts the behaviour, not the literal default.
+    """
+    import inspect
+
+    from auto_chasm.class_means import _resolve_whiten, fit_mass_mean
+
+    assert inspect.signature(fit_mass_mean).parameters["whiten"].default is None
+    model, _, _ = fitted
+    assert not any(_resolve_whiten(model.probes, None).values())
+    assert all(p.whitening is None for p in model.probes.values())
+
+
+def test_plain_fit_leaves_no_whitening_on_the_probe(fitted: tuple) -> None:
+    model, _, _ = fitted
+    assert all(p.whitening is None for p in model.probes.values())
+
+
+def test_whitened_direction_differs_from_theta() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    plain = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    white = to_numpy(m.probes["L5"].module.weight).reshape(-1).astype(np.float64)
+
+    cos = float(plain @ white / (np.linalg.norm(plain) * np.linalg.norm(white)))
+    assert cos < 0.99          # genuinely rotated, not merely rescaled
+
+
+def test_refitting_without_whiten_clears_the_transform() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    assert m.probes["L5"].whitening is not None
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    assert m.probes["L5"].whitening is None
+
+
+def test_probe_scores_equal_scoring_the_whitened_state_by_hand() -> None:
+    """The folded weight/bias must agree with the exposed transform.
+
+    The head computes ``w . h + b``; the transform says the score is
+    ``theta_white . Sigma^-1/2 (h - mu)``. If these ever drift apart, the probe
+    and the geometry would be describing different spaces.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+
+    hs = m.hidden_states(te, batch_size=4, max_seq_length=128)
+    h = hs.states[5].astype(np.float64)
+    probe = m.probes["L5"]
+    w = to_numpy(probe.module.weight).reshape(-1).astype(np.float64)
+    b = float(to_numpy(probe.module.bias).reshape(-1)[0])
+
+    by_head = h @ w + b
+    by_hand = probe.whiten(h) @ res["L5"]["theta_whitened"]
+    assert np.allclose(by_head, by_hand, rtol=1e-4, atol=1e-4)
+
+
+def test_whiten_without_a_fit_says_how_to_get_one(fitted: tuple) -> None:
+    model, _, _ = fitted
+    probe = next(iter(model.probes.values()))
+    with pytest.raises(RuntimeError, match="whiten=True"):
+        probe.whiten(np.zeros((3, probe.hidden_dim)))
+
+
+def test_whitening_warns_when_tokens_are_scarce(caplog: pytest.LogCaptureFixture) -> None:
+    """A hidden x hidden covariance from fewer states than dimensions is noise."""
+    import logging
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    with caplog.at_level(logging.WARNING):
+        m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    # getMessage() applies the args; .message is the raw format string.
+    assert any("whitening a" in r.getMessage() for r in caplog.records)
+
+
+def test_whitening_survives_a_checkpoint_round_trip(tmp_path: Path) -> None:
+    """Saving a whitened probe must carry mu and Sigma^-1/2 with it."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    before = m.probes["L5"].whitening
+    assert before is not None
+    hs = m.hidden_states(te, batch_size=4, max_seq_length=128)
+    h = hs.states[5].astype(np.float64)
+    whitened_before = m.probes["L5"].whiten(h)
+    scores_before = np.asarray(
+        m.probe_scores(te, batch_size=4, max_seq_length=128).scores["L5"]
+    )
+
+    m.save_checkpoint(str(tmp_path / "ck"))
+    restored = Model.from_checkpoint(str(tmp_path / "ck"),
+                                     base_model="HuggingFaceTB/SmolLM2-135M")
+
+    after = restored.probes["L5"].whitening
+    assert after is not None
+    for key in ("mean", "whitener", "cov"):
+        assert np.allclose(before[key], after[key]), key
+    assert np.allclose(whitened_before, restored.probes["L5"].whiten(h))
+    # ...and the reloaded probe must actually SCORE the same, not merely carry
+    # the same arrays: the transform is folded into the head's weight and bias.
+    scores_after = np.asarray(
+        restored.probe_scores(te, batch_size=4, max_seq_length=128).scores["L5"]
+    )
+    assert np.allclose(scores_before, scores_after)
+
+
+def test_checkpoint_without_whitening_restores_none(tmp_path: Path) -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    m.save_checkpoint(str(tmp_path / "ck"))
+    restored = Model.from_checkpoint(str(tmp_path / "ck"),
+                                     base_model="HuggingFaceTB/SmolLM2-135M")
+    assert restored.probes["L5"].whitening is None
+
+
+def test_resaving_without_whitening_removes_the_stale_file(tmp_path: Path) -> None:
+    """A refit that drops whitening must not leave the old transform on disk."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    ck = tmp_path / "ck"
+    m.fit_mass_mean(tr, whiten=True, batch_size=4, max_seq_length=128)
+    m.save_checkpoint(str(ck))
+    stale = ck / "probes" / "L5.whitening.safetensors"
+    assert stale.exists()
+
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+    m.save_checkpoint(str(ck))
+    assert not stale.exists()
+    assert (ck / "probes" / "L5.safetensors").exists()   # weights kept, not pruned
+
+
+# --- automatic (Ledoit-Wolf) shrinkage ---------------------------------------
+
+
+def _many_conversations(n_conv: int) -> list:
+    """A corpus large enough that the covariance is actually determined."""
+    return [
+        [{"role": "user", "content": f"Who built device {p}?"},
+         {"role": "assistant",
+          "content": (f"It was Nikola Tesla in {1900 + p}." if p % 2 == 0
+                      else f"It was Alexander Bell in {1900 + p}."),
+          "labels": {"halluc": [{"start": 7, "end": 19, "label": 1}]
+                     if p % 2 == 0 else []}}]
+        for p in range(n_conv)
+    ]
+
+
+def _lw_rho_batch(h: np.ndarray) -> float:
+    """Ledoit-Wolf intensity computed the obvious way: whole matrix in memory."""
+    n, d = h.shape
+    x = h - h.mean(0)
+    cov = x.T @ x / n
+    m = np.trace(cov) / d
+    d2 = np.sum(cov * cov) / d - m * m
+    b2_bar = (np.sum(np.sum(x * x, axis=1) ** 2) - n * np.sum(cov * cov)) / (n * n * d)
+    return float(min(max(b2_bar, 0.0), d2) / d2)
+
+
+def test_auto_shrinkage_matches_a_batch_reference() -> None:
+    """Our ONE-PASS Ledoit-Wolf must equal the same formula computed in batch.
+
+    The fourth moment is accumulated about a frozen offset and corrected to the
+    true mean afterwards. That algebra is the part most likely to be silently
+    wrong -- it would surface only as a quietly mis-tuned ridge, never an error.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(200),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, shrinkage="auto",
+                          batch_size=8, max_seq_length=128)
+    lam = res["L5"]["shrinkage"]
+    rho_ours = lam / (1.0 + lam)          # undo lambda = rho / (1 - rho)
+
+    hs = m.hidden_states(tr, batch_size=8, max_seq_length=128, max_tokens=None)
+    # Loose on purpose: b^2 is a difference of two large near-equal quantities,
+    # and the moments are accumulated in float32 (MLX has no float64 on GPU), so
+    # ~1e-3 is the precision floor -- it lands at 1e-9 on the GPU and 4e-4 on the
+    # CPU the tests pin. Irrelevant for a ridge coefficient. The exact algebra is
+    # pinned in float64 by test_lw_algebra_recovers_the_fourth_moment_exactly.
+    assert rho_ours == pytest.approx(_lw_rho_batch(hs.states[5].astype(np.float64)),
+                                     rel=1e-2)
+
+
+def test_lw_algebra_recovers_the_fourth_moment_exactly() -> None:
+    """Pin the offset correction itself, in float64, with the offset far off.
+
+    ``_lw_shrinkage`` reconstructs ``sum ||x - mu||^4`` from moments taken about a
+    frozen offset ``o``. When ``o`` happens to sit near the mean those correction
+    terms are tiny, so an end-to-end test would pass even with one of them
+    dropped. Here ``o`` is deliberately far away, which makes every term matter.
+    """
+    from auto_chasm.class_means import _lw_shrinkage
+
+    rng = np.random.default_rng(0)
+    n, d = 900, 40
+    mixing = rng.normal(0, 1, (d, d))
+    mixing[:, 0] *= 8
+    x = rng.normal(0, 1, (n, d)) @ mixing.T + 5.0
+
+    offset = x.mean(0) + 30.0            # nowhere near the mean
+    g = x - offset
+    delta = x.mean(0) - offset
+    entry = {
+        "counts": (n / 2.0, n / 2.0),
+        "scatter": g.T @ g - n * np.outer(delta, delta),   # centered on the mean
+        "mean": x.mean(0),
+        "m2": g.T @ g,
+        "s4": float(np.sum(np.sum(g * g, axis=1) ** 2)),
+        "v3": (g * np.sum(g * g, axis=1)[:, None]).sum(0),
+        "offset": offset,
+    }
+    lam = _lw_shrinkage(entry, "probe")
+    # rel=1e-6, not tighter: pushing the offset this far makes the correction
+    # terms ~1e5x the answer, so even float64 loses digits recombining them. It
+    # stays hugely discriminating -- dropping any single term moves the result by
+    # orders of magnitude, not parts per million.
+    assert lam / (1.0 + lam) == pytest.approx(_lw_rho_batch(x), rel=1e-6)
+
+
+def test_auto_shrinkage_matches_the_sklearn_reference() -> None:
+    """And the formula itself matches the canonical implementation."""
+    cov_mod = pytest.importorskip("sklearn.covariance")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(200),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, shrinkage="auto",
+                          batch_size=8, max_seq_length=128)
+    lam = res["L5"]["shrinkage"]
+    rho_ours = lam / (1.0 + lam)
+
+    hs = m.hidden_states(tr, batch_size=8, max_seq_length=128, max_tokens=None)
+    rho_sklearn = cov_mod.ledoit_wolf_shrinkage(
+        hs.states[5].astype(np.float64), assume_centered=False
+    )
+    assert rho_ours == pytest.approx(rho_sklearn, rel=1e-6)
+
+
+def test_auto_is_not_the_default() -> None:
+    import inspect
+
+    from auto_chasm.class_means import fit_mass_mean
+
+    assert inspect.signature(fit_mass_mean).parameters["shrinkage"].default == 1e-2
+
+
+def test_auto_reports_the_coefficient_it_picked() -> None:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, shrinkage="auto",
+                          batch_size=4, max_seq_length=128)
+    lam = res["L5"]["shrinkage"]
+    assert np.isfinite(lam) and lam > 0.0
+    # and a fixed value is echoed back unchanged, so the field always means the
+    # coefficient actually applied
+    fixed = m.fit_mass_mean(tr, whiten=True, shrinkage=0.05,
+                            batch_size=4, max_seq_length=128)
+    assert fixed["L5"]["shrinkage"] == 0.05
+
+
+def test_auto_shrinks_harder_when_data_is_scarcer() -> None:
+    """Less data per dimension -> a noisier covariance -> more shrinkage."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    lams = []
+    for n_conv in (8, 120):
+        ds = Dataset.from_conversations(conversations=_many_conversations(n_conv),
+                                        tokenizer=m.tokenizer, default_label=0)
+        r = m.fit_mass_mean(ds, whiten=True, shrinkage="auto",
+                            batch_size=4, max_seq_length=128)
+        lams.append(r["L5"]["shrinkage"])
+    assert lams[0] > lams[1]
+
+
+# --- steering along a fitted mass-mean direction ------------------------------
+
+
+def test_fit_mass_mean_output_feeds_enable_steering_directly() -> None:
+    """The two APIs must compose without the caller converting types by hand.
+
+    ``fit_mass_mean`` returns NumPy; the steering geometry stacks BACKEND tensors.
+    Passing the result straight through used to raise ``expected Tensor ... but
+    got numpy.ndarray`` on both backends, which made the obvious call impossible.
+    """
+    from auto_chasm import SteeringConfig
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(60),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, batch_size=8, max_seq_length=128)
+
+    # Steer along the WHITENED direction, which is what the head already holds.
+    direction = m.probes["L5"].module.weight.reshape(-1)
+    m.enable_steering("L5",
+                      config=SteeringConfig(method="nullify", direction=direction),
+                      class_means=res)
+    assert m.steering_hooks["L5"].has_geometry
+
+
+def test_a_numpy_direction_is_accepted(fitted: tuple) -> None:
+    """A direction taken from the fit result is NumPy; it must not need casting."""
+    from auto_chasm import SteeringConfig
+
+    model, _, means = fitted
+    name = next(iter(model.probes))
+    model.enable_steering(
+        name,
+        config=SteeringConfig(method="nullify", direction=means[name]["theta"]),
+        class_means=means,
+    )
+    assert model.steering_hooks[name].has_geometry
+
+
+def test_steering_direction_survives_a_checkpoint(tmp_path: Path) -> None:
+    from auto_chasm import SteeringConfig
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr = Dataset.from_conversations(conversations=_many_conversations(60),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(tr, whiten=True, batch_size=8, max_seq_length=128)
+    m.enable_steering("L5",
+                      config=SteeringConfig(method="nullify",
+                                            direction=m.probes["L5"].module.weight.reshape(-1)),
+                      class_means=res)
+    before = to_numpy(m.steering_hooks["L5"].config.direction).reshape(-1)
+
+    m.save_checkpoint(str(tmp_path / "ck"))
+    restored = Model.from_checkpoint(str(tmp_path / "ck"),
+                                     base_model="HuggingFaceTB/SmolLM2-135M")
+
+    hook = restored.steering_hooks["L5"]
+    assert hook.has_geometry and hook.config.method == "nullify"
+    assert np.allclose(before, to_numpy(hook.config.direction).reshape(-1), atol=1e-5)
+    assert restored.probes["L5"].whitening is not None   # and the transform came too
+
+
+def test_to_tensor_lands_on_the_models_device() -> None:
+    """A custom steer_fn adds this straight to the hidden states.
+
+    ``forward`` moves its own inputs, so a CPU result went unnoticed there — but
+    ``hidden + delta`` inside a steer_fn raised "Expected all tensors to be on
+    the same device" the moment the model was not on the CPU.
+    """
+    torch = pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch")
+    if torch.backends.mps.is_available():
+        m.model = m.model.to("mps")
+    elif torch.cuda.is_available():
+        m.model = m.model.to("cuda")
+
+    expected = next(m.model.parameters()).device
+    assert m.to_tensor(np.zeros(4, dtype=np.float32)).device == expected
+
+
+def test_a_constant_steer_fn_runs_on_the_models_device() -> None:
+    """End to end: fit, steer with a to_tensor delta, generate."""
+    torch = pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch")
+    if torch.backends.mps.is_available():
+        m.model = m.model.to("mps")
+    elif torch.cuda.is_available():
+        m.model = m.model.to("cuda")
+
+    ds = Dataset.from_conversations(conversations=_many_conversations(20),
+                                    tokenizer=m.tokenizer, default_label=0)
+    m.add_probes([ProbeConfig(name="L5", layers=[5], module_config={"out_features": 1})])
+    res = m.fit_mass_mean(ds, batch_size=4, max_seq_length=128)
+
+    delta = m.to_tensor(np.asarray(res["L5"]["theta"], dtype=np.float32))
+
+    def steer(hidden: object, head: object, logits: object) -> object:
+        return hidden + delta          # the line that used to blow up
+
+    m.enable_steering("L5", steer_fn=steer)
+    assert isinstance(m.generate(prompt="Who built it?", max_tokens=4, temperature=0.0), str)
+
+
+# --- the built-in "mass_mean" head ------------------------------------------
+#
+# The same fitted direction, but attached like any other probe: declared with a
+# plain string, so it round-trips through the checkpoint manifest, and frozen, so
+# joint training can recalibrate it without rotating it.
+
+
+def _mm_model() -> tuple[Model, Dataset, Dataset]:
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+    return m, tr, te
+
+
+def _trainable(module: object) -> list[str]:
+    from mlx.utils import tree_flatten
+
+    return sorted(k for k, _ in tree_flatten(module.trainable_parameters()))
+
+
+def _saved(module: object) -> list[str]:
+    from mlx.utils import tree_flatten
+
+    return sorted(k for k, _ in tree_flatten(module.parameters()))
+
+
+def test_mass_mean_head_starts_unfitted() -> None:
+    """An unfitted head scores a CONSTANT, not a random direction.
+
+    A random init would look like a working probe and quietly report noise as
+    signal; an all-zero direction is unmistakably broken.
+    """
+    m, _, _ = _mm_model()
+    assert not to_numpy(m.probes["halluc"].module.direction).any()
+
+
+def test_direction_is_saved_but_never_trainable() -> None:
+    """``direction`` must be in ``parameters()`` yet out of ``trainable_parameters()``.
+
+    The first is what the checkpoint writer walks, so a saved probe reloads
+    complete with no side-car file; the second is what the optimizer walks, so no
+    training step can rotate the axis.
+    """
+    m, _, _ = _mm_model()
+    module = m.probes["halluc"].module
+    assert _saved(module) == ["bias", "direction", "scale"]
+    assert _trainable(module) == ["bias", "scale"]
+
+
+def test_direction_survives_the_unfreeze_paths() -> None:
+    """``prepare_for_joint_training`` unfreezes every probe — the direction must resist.
+
+    ``_TrainableModel.__init__`` also calls ``probe.module.unfreeze()`` on each
+    wrapped probe, so without the head's own re-freeze the "mass-mean" probe would
+    silently become an ordinary trainable linear one the moment training started.
+    """
+    m, _, _ = _mm_model()
+    module = m.probes["halluc"].module
+    module.unfreeze()
+    assert _trainable(module) == ["bias", "scale"]
+    m.prepare_for_joint_training()
+    assert _trainable(module) == ["bias", "scale"]
+
+
+def test_fit_writes_a_unit_direction_and_moves_the_norm_into_scale() -> None:
+    """The head stores ``theta/|theta|`` with ``|theta|`` in ``scale``."""
+    m, tr, _ = _mm_model()
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    module = m.probes["halluc"].module
+    d = to_numpy(module.direction).astype(np.float64)
+    assert np.linalg.norm(d) == pytest.approx(1.0, abs=1e-5)
+    assert float(to_numpy(module.scale)) > 0.0
+
+
+def test_mass_mean_head_scores_exactly_like_the_linear_one() -> None:
+    """Swapping the head changes WHAT IS TRAINABLE, never the fitted function.
+
+    Both probes are fitted on the same data at the same layer, so their scores —
+    and therefore their AUROC — must agree; the frozen head only splits the same
+    weight into a unit direction and a scale.
+    """
+    m_lin = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m_lin)
+    m_lin.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="linear")])
+    m_lin.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+
+    m_mm, _, _ = _mm_model()
+    m_mm.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+
+    s_lin = m_lin.probe_scores(te, batch_size=4, max_seq_length=128)
+    s_mm = m_mm.probe_scores(te, batch_size=4, max_seq_length=128)
+    assert s_mm.auroc("halluc") == pytest.approx(s_lin.auroc("halluc"), abs=1e-6)
+
+
+def test_training_recalibrates_but_does_not_rotate(tmp_path: Path) -> None:
+    """Joint training moves scale/bias and leaves the direction bit-identical."""
+    from auto_chasm import JointLoss, Trainer
+
+    m, tr, te = _mm_model()
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    m.prepare_for_joint_training()
+    module = m.probes["halluc"].module
+    before_d = to_numpy(module.direction).copy()
+    before_s = float(to_numpy(module.scale))
+
+    Trainer(model=m, loss_fn=JointLoss(weights={"lm_head": 0.0, "halluc": 1.0}),
+            learning_rate=1e-2, batch_size=4, grad_accum_steps=1, num_iters=4,
+            max_seq_length=128, save_steps=0, eval_steps=0, logging_steps=4,
+            output_dir=str(tmp_path), seed=0, verbose=False).train(train_data=tr, val_data=te)
+
+    assert np.array_equal(to_numpy(module.direction), before_d)
+    assert float(to_numpy(module.scale)) != before_s
+
+
+def test_checkpoint_round_trip_needs_no_side_car(tmp_path: Path) -> None:
+    """``"mass_mean"`` is a string, so the manifest rebuilds the head on load.
+
+    A custom callable head serialises as ``"__callable__"`` and cannot be
+    reconstructed, which forces callers to persist the direction themselves and
+    rebuild by hand before loading. This is the whole reason the head is built in.
+    """
+    m, tr, te = _mm_model()
+    m.fit_mass_mean(tr, probe_names=["halluc"], whiten=True, batch_size=4, max_seq_length=128)
+    before = m.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc")
+
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+    m2 = Model.from_checkpoint(str(ck))
+
+    module = m2.probes["halluc"].module
+    assert np.array_equal(to_numpy(module.direction), to_numpy(m.probes["halluc"].module.direction))
+    assert _trainable(module) == ["bias", "scale"]
+    assert m2.probes["halluc"].whitening is not None
+    after = m2.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc")
+    assert after == pytest.approx(before, abs=1e-9)
+
+
+def test_mass_mean_head_is_single_logit() -> None:
+    """A direction is one axis; asking for more outputs is a config error."""
+    from auto_chasm.modules import build_probe_module
+
+    cfg = ProbeConfig(name="p", layers=[2], module_type="mass_mean")
+    with pytest.raises(ValueError, match="single-logit"):
+        build_probe_module(cfg, 16, {"out_features": 3}, "mlx")
+
+
+def test_mass_mean_head_is_frozen_and_saved_on_torch() -> None:
+    """Torch reaches the same two guarantees by a different mechanism than MLX.
+
+    A persistent BUFFER is in ``state_dict()`` (so the checkpoint carries the
+    direction) but not in ``parameters()`` — which is exactly what
+    ``Backend.unfreeze``'s ``requires_grad`` sweep walks, so it cannot be released.
+    """
+    torch = pytest.importorskip("torch")
+    from auto_chasm.modules import build_probe_module
+
+    cfg = ProbeConfig(name="p", layers=[2], module_type="mass_mean")
+    head = build_probe_module(cfg, 16, {"out_features": 1}, "torch")
+
+    assert sorted(n for n, _ in head.named_parameters()) == ["bias", "scale"]
+    assert "direction" in head.state_dict()
+
+    for prm in head.parameters():          # what Backend.unfreeze() does
+        prm.requires_grad = True
+    assert not head.direction.requires_grad
+
+    d = np.random.randn(16).astype(np.float32)
+    d /= np.linalg.norm(d)
+    with torch.no_grad():
+        head.direction.copy_(torch.tensor(d))
+        head.scale.copy_(torch.tensor(2.5))
+        head.bias.copy_(torch.tensor(-0.75))
+
+    x = torch.randn(2, 3, 16)
+    expected = (2.5 * (x.numpy() * d).sum(-1) - 0.75)[..., None]
+    assert np.allclose(head(x).detach().numpy(), expected, atol=1e-5)
+
+    before = head.direction.clone()
+    torch.optim.SGD(list(head.parameters()), lr=0.1).zero_grad()
+    loss = head(x).square().mean()
+    loss.backward()
+    torch.optim.SGD(list(head.parameters()), lr=0.1).step()
+    assert torch.equal(before, head.direction)
+
+
+def test_mass_mean_head_end_to_end_on_torch(tmp_path: Path) -> None:
+    """Fit -> train -> save -> load on the TORCH backend, not just the head in isolation.
+
+    The torch branch of ``_write_mass_mean`` is what runs on a CUDA box; the
+    isolated head test above never reaches it. This walks the whole path the way a
+    fine-tuning script does, and checks the two invariants that matter: the fitted
+    direction is a unit vector, and training moves only the calibration.
+    """
+    pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+
+    m.fit_mass_mean(tr, probe_names=["halluc"], whiten=True, batch_size=4, max_seq_length=128)
+    module = m.probes["halluc"].module
+    d = to_numpy(module.direction).astype(np.float64)
+    assert np.linalg.norm(d) == pytest.approx(1.0, abs=1e-5)
+
+    from auto_chasm import JointLoss, Trainer
+
+    m.prepare_for_joint_training()
+    assert not module.direction.requires_grad
+    before_d, before_s = to_numpy(module.direction).copy(), float(to_numpy(module.scale))
+    Trainer(model=m, loss_fn=JointLoss(weights={"lm_head": 0.0, "halluc": 1.0}),
+            learning_rate=1e-2, batch_size=4, grad_accum_steps=1, num_iters=4,
+            max_seq_length=128, save_steps=0, eval_steps=0, logging_steps=4,
+            output_dir=str(tmp_path / "run"), seed=0, verbose=False).train(
+                train_data=tr, val_data=te)
+    assert np.array_equal(to_numpy(module.direction), before_d)
+    assert float(to_numpy(module.scale)) != before_s
+
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+    m2 = Model.from_checkpoint(str(ck))
+    assert np.array_equal(to_numpy(m2.probes["halluc"].module.direction), before_d)
+    assert not m2.probes["halluc"].module.direction.requires_grad
+
+
+def test_mass_mean_whiten_probe_whitens_without_being_told() -> None:
+    """``"mass_mean_whiten"`` carries its own fit mode.
+
+    This is the footgun the type exists to remove: declaring the whitened arm and
+    then forgetting ``whiten=True`` at the fit call used to hand back the plain
+    probe, silently, with nothing in the checkpoint to show which one you got.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean_whiten")])
+
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+
+    assert m.probes["halluc"].whitening is not None
+    d = to_numpy(m.probes["halluc"].module.direction).astype(np.float64)
+    assert np.linalg.norm(d) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_plain_mass_mean_probe_still_does_not_whiten() -> None:
+    """The declaration only opts IN; a plain ``"mass_mean"`` probe is unchanged."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    assert m.probes["halluc"].whitening is None
+
+
+def test_explicit_whiten_argument_overrides_the_declaration() -> None:
+    """An explicit ``whiten=`` still wins, so the old behaviour is always reachable."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean_whiten")])
+    m.fit_mass_mean(tr, probe_names=["halluc"], whiten=False, batch_size=4, max_seq_length=128)
+    assert m.probes["halluc"].whitening is None
+
+
+def test_whitened_and_plain_probes_fit_together_in_one_pass() -> None:
+    """Mixed declarations in a single call: each probe gets what it asked for.
+
+    The covariance is shared work, accumulated once because SOME probe needs it,
+    and applied only to the probes that declared whitening.
+    """
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, _ = _data(m)
+    m.add_probes([
+        ProbeConfig(name="plain", layers=[5], module_type="mass_mean"),
+        ProbeConfig(name="white", layers=[5], module_type="mass_mean_whiten"),
+    ])
+    m.fit_mass_mean(tr, batch_size=4, max_seq_length=128)
+
+    assert m.probes["plain"].whitening is None
+    assert m.probes["white"].whitening is not None
+    dp = to_numpy(m.probes["plain"].module.direction).astype(np.float64)
+    dw = to_numpy(m.probes["white"].module.direction).astype(np.float64)
+    assert not np.allclose(dp, dw), "whitening must change the direction"
+
+
+def test_mass_mean_whiten_survives_the_checkpoint(tmp_path: Path) -> None:
+    """The declaration is part of ``module_type``, so a reload knows what it is."""
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tr, te = _data(m)
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean_whiten")])
+    m.fit_mass_mean(tr, probe_names=["halluc"], batch_size=4, max_seq_length=128)
+    before = m.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc")
+
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+    m2 = Model.from_checkpoint(str(ck))
+
+    assert m2.probes["halluc"].config.module_type == "mass_mean_whiten"
+    assert m2.probes["halluc"].module._whiten_by_default is True
+    assert m2.probe_scores(te, batch_size=4, max_seq_length=128).auroc("halluc") == pytest.approx(
+        before, abs=1e-9
+    )
+
+
+def test_checkpoint_reloads_in_the_dtype_it_was_saved_in(tmp_path: Path) -> None:
+    """A checkpoint must not silently come back in a different precision.
+
+    ``load_checkpoint`` used to call ``from_pretrained`` with no dtype, so a model
+    trained in bf16 reloaded at the loader default -- float32 on torch -- doubling
+    memory and changing the numerics against training. The dtype is now recorded in
+    the manifest and reapplied on load.
+    """
+    import json
+
+    import mlx.core as mx
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", dtype="bfloat16")
+    m.add_probes([ProbeConfig(name="halluc", layers=[5], module_type="mass_mean")])
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+
+    with open(ck / "manifest.json") as fh:
+        assert json.load(fh)["dtype"] == "bfloat16"
+
+    from mlx.utils import tree_flatten
+
+    m2 = Model.from_checkpoint(str(ck))
+    assert tree_flatten(m2.model.parameters())[0][1].dtype == mx.bfloat16
+
+
+def test_explicit_dtype_overrides_the_manifest_on_torch(tmp_path: Path) -> None:
+    """An explicit dtype wins over the manifest, so the recorded value is a default.
+
+    Torch-only on purpose: the MLX loader drops ``dtype`` entirely (mlx_lm has no
+    such argument and its ports are already bf16), so there is nothing to override
+    there. Torch is also where the original bug bit -- its default is float32.
+    """
+    torch = pytest.importorskip("torch")
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", backend_name="torch",
+                              dtype="bfloat16")
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+
+    assert next(Model.from_checkpoint(str(ck)).model.parameters()).dtype == torch.bfloat16
+    m2 = Model.from_checkpoint(str(ck), dtype="float32")
+    assert next(m2.model.parameters()).dtype == torch.float32
+
+
+def test_checkpoint_without_a_recorded_dtype_still_loads(tmp_path: Path) -> None:
+    """Checkpoints written before the dtype was recorded must keep loading."""
+    import json
+
+    m = Model.from_pretrained("HuggingFaceTB/SmolLM2-135M", dtype="bfloat16")
+    ck = tmp_path / "ck"
+    m.save_checkpoint(str(ck))
+
+    with open(ck / "manifest.json") as fh:
+        manifest = json.load(fh)
+    del manifest["dtype"]                       # emulate an older checkpoint
+    with open(ck / "manifest.json", "w") as fh:
+        json.dump(manifest, fh)
+
+    assert Model.from_checkpoint(str(ck)) is not None
